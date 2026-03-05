@@ -1,17 +1,13 @@
-FROM heroiclabs/nakama-pluginbuilder:3.26.0 AS builder
-
-ENV GO111MODULE on
-ENV CGO_ENABLED 1
-ENV GOPRIVATE "github.com/heroiclabs/nakama-project-template"
+FROM node:18-alpine AS builder
 
 WORKDIR /backend
+COPY package*.json ./
+RUN npm install
 COPY . .
-
-RUN go build --trimpath --mod=vendor --buildmode=plugin -o ./backend.so
+RUN npx tsc
 
 FROM heroiclabs/nakama:3.26.0
 
-COPY --from=builder /backend/backend.so /nakama/data/modules
-COPY --from=builder /backend/*.lua /nakama/data/modules/
-COPY --from=builder /backend/build/*.js /nakama/data/modules/build/
-COPY --from=builder /backend/local.yml /nakama/data/
+RUN mkdir -p /nakama/data/modules/build
+COPY --from=builder /backend/build/index.js /nakama/data/modules/build/
+COPY local.yml /nakama/data/

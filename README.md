@@ -1,137 +1,209 @@
-Nakama Project Template
-===
+# NakamaRetroStore
 
-> An example project template on how to set up and write custom logic in Nakama server.
+Backend cho hệ thống **Retro Achievement** — xây dựng trên [Nakama](https://heroiclabs.com/nakama/) (TypeScript runtime) + PostgreSQL.
 
-The codebase shows a few simple gameplay features written in all three of the runtime framework languages supported by the server: Go, Lua, and TypeScript. The code shows how to read/write storage objects, send in-app notifications, parse JSON, update player wallets, and handle errors.
+---
 
-For more documentation have a look at:
+## Stack
 
-* https://heroiclabs.com/docs/nakama/server-framework/introduction/index.html
-* https://heroiclabs.com/docs/nakama/concepts/storage/
-* https://heroiclabs.com/docs/nakama/concepts/user-accounts/#virtual-wallet
-* https://heroiclabs.com/docs/nakama/concepts/notifications/
-* https://heroiclabs.com/docs/nakama/concepts/multiplayer/authoritative/
+| Service | Image | Mô tả |
+|---------|-------|-------|
+| **nakama** | `heroiclabs/nakama:3.26.0` | Game server, chạy TypeScript module |
+| **postgres** | `postgres:12.2-alpine` | Database chính |
+| **tf** | `tensorflow/serving` | TensorFlow Serving (model inference) |
 
-For a detailed guide on setting up TypeScript check out the [Setup page](https://heroiclabs.com/docs/nakama/server-framework/typescript-runtime/).
+---
 
-__NOTE__ You can remove the Go, Lua or TypeScript code within this project to develop with just the single language you prefer.
+## Cấu trúc dự án
 
-### Prerequisites
-
-The codebase requires these development tools:
-
-* Go compiler and runtime: 1.15.2 or greater.
-* Docker Engine: 19.0.0 or greater.
-* Node v14 (active LTS) or greater.
-* Basic UNIX tools or knowledge on the Windows equivalents.
-
-### Go Dependencies
-
-The project uses Go modules which should be vendored as normal:
-
-```shell
-env GO111MODULE=on GOPRIVATE="github.com" go mod vendor
+```
+src/
+  main.ts            # InitModule — đăng ký tất cả RPCs
+  users.ts           # User profile & điểm
+  achievements.ts    # Achievement definitions & user unlocks
+build/
+  index.js           # TypeScript compiled output (auto-generated)
+api/
+  xoxoapi.proto      # Protobuf schema
+local.yml            # Nakama server config
+docker-compose.yml
+Dockerfile
+tsconfig.json
 ```
 
-### TypeScript Dependencies
+---
 
-The project uses NPM to manage dependencies which can be installed as normal:
+## Khởi động
 
-```shell
-npm install
-```
-
-Before you start the server you can transpile the TypeScript code to JavaScript code with the TypeScript compiler:
-
-```shell
-npx tsc
-```
-
-The bundled JavaScript code output can be found in "build/index.js".
-
-### Start
-
-The recommended workflow is to use Docker and the compose file to build and run the game server, database resources and tensorflow-serving (AI model server).
-
-```shell
+```bash
 docker compose up --build nakama
 ```
 
-### Recompile / Run
+Lần đầu sẽ tự động chạy database migration. Các lần tiếp theo:
 
-When the containers have been started as shown above you can replace just the game server custom code and recompile it with the `-d` option.
-
-```shell
-docker compose up -d --build nakama
+```bash
+docker compose up nakama
 ```
 
-### Stop
+Build lại không dùng cache:
 
-To stop all running containers you can use the Docker compose sub-command.
-
-```shell
-docker compose down
+```bash
+docker compose build --no-cache nakama && docker compose up nakama
 ```
 
-You can wipe the database and workspace with `docker compose down -v` to remove the disk volumes.
+---
 
-### Run RPC function
+## Ports
 
-A bunch of RPC IDs are registered with the server logic. A couple of these are:
+| Port | Mô tả |
+|------|-------|
+| `7349` | Nakama socket (real-time) |
+| `7350` | Nakama HTTP API |
+| `7351` | Nakama gRPC |
+| `5432` | PostgreSQL |
 
-* "rewards" in Go or as "reward" in Lua.
-* "refreshes" in Go or as "refresh" in Lua.
+**Nakama Console:** http://localhost:7351 (admin: `admin` / `password`)
 
-To execute the RPC function with cURL generated a session token:
+---
 
-```shell
-curl "127.0.0.1:7350/v2/account/authenticate/device" --data "{\"id\": \""$(uuidgen)"\"}" --user 'defaultkey:'
+## HTTP API
+
+Base URL: `http://localhost:7350`
+
+Tất cả endpoints đều qua `POST /v2/rpc/{name}`.
+
+### Authentication
+
+| Loại | Header / Query |
+|------|----------------|
+| User session | `Authorization: Bearer <session_token>` |
+| Server-to-server | `?http_key=retro_server_http_key` |
+
+---
+
+### Users
+
+#### Lấy profile của chính mình
+```
+GET /v2/rpc/users-me
+Authorization: Bearer <token>
+```
+Response:
+```json
+{
+  "id": "uuid",
+  "username": "player1",
+  "email": "player1@example.com",
+  "created_at": 1741132800,
+  "total_points": 500
+}
 ```
 
-Take the session token in the response and use it to execute the RPC function as the user:
+#### Lấy profile theo user ID (public)
+```
+POST /v2/rpc/users-by-id
+Authorization: Bearer <token>
 
-```shell
-curl "127.0.0.1:7350/v2/rpc/rewards" -H 'Authorization: Bearer $TOKEN' --data '""'
+{ "user_id": "uuid" }
 ```
 
-This will generate an RPC response on the initial response in that day and grant no more until the rollover.
-
+#### Cộng điểm thủ công
 ```
-{"payload":"{\"coins_received\":500}"}
-or
-{"payload":"{\"coins_received\":0}"}
-```
+POST /v2/rpc/users-me-points
+Authorization: Bearer <token>
 
-You can also skip the cURL steps and use the [Nakama Console's API Explorer](http://127.0.0.1:7351/apiexplorer) to execute the RPCs.
-
-### Authoritative Multiplayer
-
-The authoritative multiplayer example includes a match handler that defines game logic, and an RPC function players should call to find a match they can join or have the server create one for them if none are available.
-
-Running the match finder RPC function registered as RPC ID "find_match" returns one or more match IDs that fit the user's criteria:
-
-```shell
-curl "127.0.0.1:7350/v2/rpc/find_match" -H 'Authorization: Bearer $TOKEN' --data '"{}"'
+{ "points": 100 }
 ```
 
-This will return one or more match IDs:
+---
 
+### Achievements
+
+#### Tạo achievement mới (admin)
 ```
-{"payload":"{\"match_ids\":[\"match ID 1\","match ID 2\",\"...\"]}"}
+POST /v2/rpc/achievements-create?http_key=retro_server_http_key
+
+{
+  "game_id": "sonic-1",
+  "title": "Speed Demon",
+  "description": "Finish Green Hill Zone in under 30 seconds",
+  "points": 50,
+  "icon": "https://cdn.example.com/icons/speed.png"
+}
 ```
 
-To join one of these matches check our [matchmaker documentation](https://heroiclabs.com/docs/nakama/concepts/multiplayer/matchmaker/#join-a-match).
+#### Lấy achievement theo ID
+```
+POST /v2/rpc/achievements-by-id?http_key=retro_server_http_key
 
-### AI/ML model
+{ "achievement_id": "uuid" }
+```
 
-In addition to starting Nakama and database, `docker-compose.yml` file
-also defines the `tf` container, an instance of [TFX](https://www.tensorflow.org/tfx) (formerly known as `Tensorflow Serving`), a service to serve
-pre-trained machine learning models.
-The model itself is located in the [./model](./model) directory.
+#### Liệt kê tất cả achievements của một game
+```
+POST /v2/rpc/achievements-by-game?http_key=retro_server_http_key
 
-### Contribute
+{ "game_id": "sonic-1" }
+```
 
-The development roadmap is managed as GitHub issues and pull requests are welcome. If you're interested to add a gameplay feature as a new example; which is not mentioned on the issue tracker please open one to create a discussion or drop in and discuss it in the [community forum](https://forum.heroiclabs.com).
+---
 
-Finally, we love feedback and would love to hear from you. Please join our [Forums](https://forum.heroiclabs.com/) and connect with us today!
+### User Achievements
+
+#### Unlock achievement
+```
+POST /v2/rpc/user-achievements-unlock
+Authorization: Bearer <token>
+
+{ "achievement_id": "uuid" }
+```
+Response:
+```json
+{
+  "already_unlocked": false,
+  "unlocked_at": 1741132800,
+  "points_earned": 50
+}
+```
+> Tự động cộng `points` vào `total_points` của user.
+
+#### Liệt kê achievements đã unlock
+```
+GET /v2/rpc/user-achievements-list
+Authorization: Bearer <token>
+```
+
+---
+
+## Storage Schema
+
+Nakama lưu dữ liệu dạng key-value trong collections:
+
+| Collection | Key | Owner | Mô tả |
+|---|---|---|---|
+| `users` | `profile` | user | Thông tin user |
+| `achievements` | `{achievement_id}` | system | Định nghĩa achievement |
+| `game_achievement_index` | `{game_id}` | system | Danh sách achievement IDs theo game |
+| `user_achievements` | `{achievement_id}` | user | Achievement đã unlock |
+
+---
+
+## Development
+
+Compile TypeScript cục bộ:
+```bash
+npm install
+npx tsc
+```
+
+---
+
+## Cấu hình (`local.yml`)
+
+| Key | Giá trị | Mô tả |
+|-----|---------|-------|
+| `runtime.js_entrypoint` | `build/index.js` | Entry point TypeScript |
+| `runtime.http_key` | `retro_server_http_key` | Key cho server-to-server API |
+| `session.token_expiry_sec` | `7200` | Session timeout (2 giờ) |
+
+> **Production:** Đổi `http_key` thành secret ngẫu nhiên và không commit vào git.

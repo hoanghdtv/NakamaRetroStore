@@ -1,11 +1,8 @@
 {
   "files": [
-    "./ai.ts",
-    "./main.ts",
-    "./daily_rewards.ts",
-    "./messages.ts",
-    "./match_handler.ts",
-    "./match_rpc.ts"
+    "src/users.ts",
+    "src/achievements.ts",
+    "src/main.ts"
   ],
   "compilerOptions": {
     "target": "es5",

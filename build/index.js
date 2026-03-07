@@ -286,6 +286,441 @@ function rpcGetUserAchievements(ctx, logger, nk, payload) {
     var userAchs = ((_a = result.objects) !== null && _a !== void 0 ? _a : []).map(function (o) { return o.value; });
     return JSON.stringify(userAchs);
 }
+// Games & RA-Achievements module — queries PostgreSQL tables populated from db/*.sql dumps
+// ─── Console → table prefix mapping ──────────────────────────────────────────
+/** Maps RetroAchievements consoleId → SQL table prefix */
+var CONSOLE_PREFIX = {
+    1: 'sega',
+    2: 'n64',
+    3: 'snes',
+    5: 'gba',
+    6: 'gbc',
+    7: 'nes',
+    12: 'psx',
+    16: 'gamecube',
+    18: 'nds',
+    27: 'mame',
+    41: 'psp',
+};
+/** All known prefixes (for cross-platform UNION queries) */
+var ALL_PREFIXES = [1, 2, 3, 5, 6, 7, 12, 16, 18, 27, 41].map(function (id) { return CONSOLE_PREFIX[id]; });
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function requirePrefix(consoleId) {
+    var p = CONSOLE_PREFIX[consoleId];
+    if (!p)
+        throw new Error("Unsupported consoleId: ".concat(consoleId));
+    return p;
+}
+function rowToGame(r) {
+    var _a, _b, _c, _d, _e;
+    return {
+        rank: (_a = r['rank']) !== null && _a !== void 0 ? _a : 0,
+        id: r['id'],
+        title: r['title'],
+        consoleName: r['consolename'],
+        consoleId: r['consoleid'],
+        totalPlayers: (_b = r['totalplayers']) !== null && _b !== void 0 ? _b : 0,
+        numAchievements: (_c = r['numachievements']) !== null && _c !== void 0 ? _c : 0,
+        points: (_d = r['points']) !== null && _d !== void 0 ? _d : 0,
+        genre: r['genre'],
+        developer: r['developer'],
+        publisher: r['publisher'],
+        released: r['released'],
+        description: r['description'],
+        icon: r['icon'],
+        boxArt: r['boxart'],
+        titleScreen: r['titlescreen'],
+        screenshot: r['screenshot'],
+        rating: (_e = r['rating']) !== null && _e !== void 0 ? _e : 0,
+    };
+}
+function rowToAchievement(r) {
+    var _a, _b, _c, _d, _e, _f;
+    return {
+        gameId: r['gameid'],
+        gameTitle: r['gametitle'],
+        achievementId: r['achievementid'],
+        title: r['title'],
+        description: r['description'],
+        points: (_a = r['points']) !== null && _a !== void 0 ? _a : 0,
+        trueRatio: (_b = r['trueratio']) !== null && _b !== void 0 ? _b : 0,
+        type: r['type'],
+        author: r['author'],
+        badgeUrl: r['badgeurl'],
+        numAwarded: (_c = r['numawarded']) !== null && _c !== void 0 ? _c : 0,
+        numAwardedHardcore: (_d = r['numawardedhardcore']) !== null && _d !== void 0 ? _d : 0,
+        displayOrder: (_e = r['displayorder']) !== null && _e !== void 0 ? _e : 0,
+        memAddr: (_f = r['memaddr']) !== null && _f !== void 0 ? _f : '',
+    };
+}
+function rowToRom(r) {
+    return {
+        gameId: r['gameid'],
+        gameTitle: r['gametitle'],
+        md5: r['md5'],
+        romName: r['romname'],
+        labels: r['labels'],
+        patchUrl: r['patchurl'],
+        region: r['region'],
+    };
+}
+// ─── RPC: List all consoles ───────────────────────────────────────────────────
+// GET /v2/rpc/games-consoles?http_key=<key>
+function rpcListConsoles(ctx, logger, nk, payload) {
+    var rows = nk.sqlQuery('SELECT id, name, "iconurl" AS iconurl, active, "isgamesystem" AS isgamesystem FROM ra_consoles ORDER BY id', []);
+    var consoles = rows.map(function (r) { return ({
+        id: r['id'],
+        name: r['name'],
+        iconUrl: r['iconurl'],
+        active: r['active'],
+        isGameSystem: r['isgamesystem'],
+    }); });
+    return JSON.stringify(consoles);
+}
+// ─── RPC: List games by console ───────────────────────────────────────────────
+// POST /v2/rpc/games-by-console?http_key=<key>
+// Payload: { "console_id": 7, "limit": 50, "offset": 0 }
+function rpcListGamesByConsole(ctx, logger, nk, payload) {
+    var _a, _b;
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.console_id)
+        throw new Error('console_id is required');
+    var prefix = requirePrefix(req.console_id);
+    var limit = Math.min((_a = req.limit) !== null && _a !== void 0 ? _a : 50, 200);
+    var offset = (_b = req.offset) !== null && _b !== void 0 ? _b : 0;
+    var rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points, genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(prefix, "_games\n         ORDER BY rank\n         LIMIT $1 OFFSET $2"), [limit, offset]);
+    return JSON.stringify(rows.map(rowToGame));
+}
+// ─── RPC: Get game by ID (searches across all platforms) ─────────────────────
+// POST /v2/rpc/games-by-id?http_key=<key>
+// Payload: { "game_id": 1446 }
+function rpcGetGameById(ctx, logger, nk, payload) {
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.game_id)
+        throw new Error('game_id is required');
+    var unionParts = ALL_PREFIXES.map(function (p) {
+        return "SELECT rank, id, title, consolename, consoleid, totalplayers, casualplayers, hardcoreplayers,\n                numachievements, points, genre, developer, publisher, released, description,\n                icon, boxart, titlescreen, screenshot, rating\n         FROM ".concat(p, "_games WHERE id = $1");
+    });
+    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [req.game_id]);
+    if (rows.length === 0)
+        throw new Error('Game not found');
+    return JSON.stringify(rowToGame(rows[0]));
+}
+// ─── RPC: Search games by title ───────────────────────────────────────────────
+// POST /v2/rpc/games-search?http_key=<key>
+// Payload: { "query": "mario", "console_id": 7, "limit": 20 }
+function rpcSearchGames(ctx, logger, nk, payload) {
+    var _a;
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.query || req.query.trim() === '')
+        throw new Error('query is required');
+    var limit = Math.min((_a = req.limit) !== null && _a !== void 0 ? _a : 20, 100);
+    var pattern = "%".concat(req.query.trim(), "%");
+    var prefixes;
+    if (req.console_id) {
+        prefixes = [requirePrefix(req.console_id)];
+    }
+    else {
+        prefixes = ALL_PREFIXES;
+    }
+    var unionParts = prefixes.map(function (p) {
+        return "SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(p, "_games WHERE LOWER(title) LIKE LOWER($1)");
+    });
+    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + " ORDER BY rank LIMIT $2", [pattern, limit]);
+    return JSON.stringify(rows.map(rowToGame));
+}
+// ─── RPC: Get related games ───────────────────────────────────────────────────
+// POST /v2/rpc/games-related?http_key=<key>
+// Payload: { "game_id": 1446 }
+function rpcGetRelatedGames(ctx, logger, nk, payload) {
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.game_id)
+        throw new Error('game_id is required');
+    var relRows = nk.sqlQuery('SELECT related FROM related_roms WHERE id = $1 LIMIT 1', [req.game_id]);
+    if (relRows.length === 0 || !relRows[0]['related'])
+        return JSON.stringify([]);
+    var relatedIds = relRows[0]['related']
+        .split(',')
+        .map(function (s) { return parseInt(s.trim(), 10); })
+        .filter(function (n) { return !isNaN(n); });
+    if (relatedIds.length === 0)
+        return JSON.stringify([]);
+    var placeholders = relatedIds.map(function (_, i) { return "$".concat(i + 1); }).join(', ');
+    var unionParts = ALL_PREFIXES.map(function (p) {
+        return "SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(p, "_games WHERE id IN (").concat(placeholders, ")");
+    });
+    var rows = nk.sqlQuery(unionParts.join(' UNION ALL '), relatedIds);
+    return JSON.stringify(rows.map(rowToGame));
+}
+// ─── RPC: List RA achievements by game ───────────────────────────────────────
+// POST /v2/rpc/ra-achievements-by-game?http_key=<key>
+// Payload: { "game_id": 1446, "console_id": 7 }
+function rpcListRAGAchievementsByGame(ctx, logger, nk, payload) {
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.game_id)
+        throw new Error('game_id is required');
+    if (!req.console_id)
+        throw new Error('console_id is required');
+    var prefix = requirePrefix(req.console_id);
+    var rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM ".concat(prefix, "_achievements\n         WHERE gameid = $1\n         ORDER BY displayorder"), [req.game_id]);
+    return JSON.stringify(rows.map(rowToAchievement));
+}
+// ─── RPC: Get single RA achievement by ID ────────────────────────────────────
+// POST /v2/rpc/ra-achievements-by-id?http_key=<key>
+// Payload: { "achievement_id": 3159, "console_id": 7 }
+function rpcGetRAAchievementById(ctx, logger, nk, payload) {
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.achievement_id)
+        throw new Error('achievement_id is required');
+    if (!req.console_id)
+        throw new Error('console_id is required');
+    var prefix = requirePrefix(req.console_id);
+    var rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM ".concat(prefix, "_achievements\n         WHERE achievementid = $1\n         LIMIT 1"), [req.achievement_id]);
+    if (rows.length === 0)
+        throw new Error('Achievement not found');
+    return JSON.stringify(rowToAchievement(rows[0]));
+}
+// ─── RPC: Unlock a RetroAchievement (adds points to user profile) ─────────────
+// POST /v2/rpc/ra-achievements-unlock
+// Authorization: Bearer <token>
+// Payload: { "achievement_id": 3159, "console_id": 7 }
+function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
+    var _a, _b, _c, _d;
+    if (!ctx.userId)
+        throw new Error('Authentication required');
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.achievement_id)
+        throw new Error('achievement_id is required');
+    if (!req.console_id)
+        throw new Error('console_id is required');
+    // Check if already unlocked in Nakama storage
+    var lockKey = "ra_".concat(req.achievement_id);
+    var existing = nk.storageRead([{
+            collection: COLLECTION_USER_ACHIEVEMENTS,
+            key: lockKey,
+            userId: ctx.userId,
+        }]);
+    if (existing.length > 0) {
+        var ua = existing[0].value;
+        return JSON.stringify({ already_unlocked: true, unlocked_at: ua.unlocked_at, points_earned: ua.points_earned });
+    }
+    // Fetch achievement from DB to get points
+    var prefix = requirePrefix(req.console_id);
+    var achRows = nk.sqlQuery("SELECT achievementid, title, points, gameid, gametitle, badgeurl\n         FROM ".concat(prefix, "_achievements WHERE achievementid = $1 LIMIT 1"), [req.achievement_id]);
+    if (achRows.length === 0)
+        throw new Error('Achievement not found');
+    var achRow = achRows[0];
+    var pointsEarned = (_a = achRow['points']) !== null && _a !== void 0 ? _a : 0;
+    var unlockedAt = Math.floor(Date.now() / 1000);
+    // Write unlock record
+    nk.storageWrite([{
+            collection: COLLECTION_USER_ACHIEVEMENTS,
+            key: lockKey,
+            userId: ctx.userId,
+            value: {
+                achievement_id: req.achievement_id,
+                achievement_title: achRow['title'],
+                game_id: achRow['gameid'],
+                game_title: achRow['gametitle'],
+                badge_url: achRow['badgeurl'],
+                points_earned: pointsEarned,
+                unlocked_at: unlockedAt,
+            },
+            permissionRead: 2,
+            permissionWrite: 0,
+        }]);
+    // Add points to user profile
+    if (pointsEarned > 0) {
+        var profileObjs = nk.storageRead([{ collection: COLLECTION_USERS, key: KEY_PROFILE, userId: ctx.userId }]);
+        var profile = profileObjs.length > 0 ? profileObjs[0].value : null;
+        if (!profile) {
+            var account = nk.accountGetId(ctx.userId);
+            var user = account.user;
+            profile = {
+                id: ctx.userId,
+                username: (_b = user.username) !== null && _b !== void 0 ? _b : '',
+                email: (_c = account.email) !== null && _c !== void 0 ? _c : '',
+                created_at: Math.floor(new Date(user.createTime).getTime() / 1000),
+                total_points: 0,
+            };
+        }
+        profile.total_points = ((_d = profile.total_points) !== null && _d !== void 0 ? _d : 0) + pointsEarned;
+        nk.storageWrite([{
+                collection: COLLECTION_USERS, key: KEY_PROFILE, userId: ctx.userId,
+                value: profile, permissionRead: 2, permissionWrite: 0,
+            }]);
+    }
+    logger.info('User %s unlocked RA achievement %d (+%d pts)', ctx.userId, req.achievement_id, pointsEarned);
+    return JSON.stringify({
+        already_unlocked: false,
+        unlocked_at: unlockedAt,
+        points_earned: pointsEarned,
+        achievement_title: achRow['title'],
+        game_title: achRow['gametitle'],
+    });
+}
+// ─── RPC: List my unlocked RA achievements ────────────────────────────────────
+// GET /v2/rpc/ra-achievements-list
+// Authorization: Bearer <token>
+// Payload (optional): { "limit": 50, "cursor": "..." }
+function rpcListMyRAAchievements(ctx, logger, nk, payload) {
+    if (!ctx.userId)
+        throw new Error('Authentication required');
+    var limit = 50;
+    var cursor;
+    if (payload) {
+        try {
+            var req = JSON.parse(payload);
+            if (typeof req.limit === 'number')
+                limit = Math.min(req.limit, 200);
+            if (typeof req.cursor === 'string')
+                cursor = req.cursor;
+        }
+        catch (_) { }
+    }
+    var result = nk.storageList(ctx.userId, COLLECTION_USER_ACHIEVEMENTS, limit, cursor);
+    var unlocks = (result.objects || []).map(function (o) { return o.value; });
+    return JSON.stringify({ unlocks: unlocks, cursor: result.cursor });
+}
+// ─── RPC: Get user stats summary ─────────────────────────────────────────────
+// GET /v2/rpc/users-me-stats
+// Authorization: Bearer <token>
+function rpcGetMyStats(ctx, logger, nk, payload) {
+    var _a;
+    if (!ctx.userId)
+        throw new Error('Authentication required');
+    // Count unlocks
+    var totalUnlocked = 0;
+    var cursor;
+    do {
+        var page = nk.storageList(ctx.userId, COLLECTION_USER_ACHIEVEMENTS, 200, cursor);
+        totalUnlocked += (page.objects || []).length;
+        cursor = page.cursor;
+    } while (cursor);
+    // Load profile for total_points
+    var profileObjs = nk.storageRead([{ collection: COLLECTION_USERS, key: KEY_PROFILE, userId: ctx.userId }]);
+    var profile = profileObjs.length > 0 ? profileObjs[0].value : {};
+    return JSON.stringify({
+        user_id: ctx.userId,
+        total_points: (_a = profile.total_points) !== null && _a !== void 0 ? _a : 0,
+        achievements_unlocked: totalUnlocked,
+    });
+}
+// ROMs & Leaderboard module
+// ─── RPC: Look up game by ROM MD5 hash ───────────────────────────────────────
+// POST /v2/rpc/roms-by-md5?http_key=<key>
+// Payload: { "md5": "8e3630186e35d477231bf8fd50e54cdd", "console_id": 7 }
+// If console_id is omitted, searches all platform tables (slower).
+function rpcGetRomByMd5(ctx, logger, nk, payload) {
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.md5 || req.md5.trim() === '')
+        throw new Error('md5 is required');
+    var md5Lower = req.md5.trim().toLowerCase();
+    var prefixes;
+    if (req.console_id) {
+        prefixes = [requirePrefix(req.console_id)];
+    }
+    else {
+        prefixes = ALL_PREFIXES;
+    }
+    var unionParts = prefixes.map(function (p) {
+        return "SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM ".concat(p, "_md5 WHERE LOWER(md5) = $1");
+    });
+    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [md5Lower]);
+    if (rows.length === 0)
+        throw new Error('ROM not found');
+    return JSON.stringify(rowToRom(rows[0]));
+}
+// ─── RPC: List ROMs for a game ────────────────────────────────────────────────
+// POST /v2/rpc/roms-by-game?http_key=<key>
+// Payload: { "game_id": 1446, "console_id": 7 }
+function rpcListRomsByGame(ctx, logger, nk, payload) {
+    var req;
+    try {
+        req = JSON.parse(payload);
+    }
+    catch (_) {
+        throw new Error('Invalid JSON payload');
+    }
+    if (!req.game_id)
+        throw new Error('game_id is required');
+    if (!req.console_id)
+        throw new Error('console_id is required');
+    var prefix = requirePrefix(req.console_id);
+    var rows = nk.sqlQuery("SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM ".concat(prefix, "_md5 WHERE gameid = $1"), [req.game_id]);
+    return JSON.stringify(rows.map(rowToRom));
+}
+// ─── RPC: Leaderboard (top users by total_points) ─────────────────────────────
+// GET /v2/rpc/users-leaderboard?http_key=<key>
+// Payload (optional): { "limit": 20 }
+function rpcUsersLeaderboard(ctx, logger, nk, payload) {
+    var limit = 20;
+    if (payload) {
+        try {
+            var req = JSON.parse(payload);
+            if (typeof req.limit === 'number')
+                limit = Math.min(req.limit, 100);
+        }
+        catch (_) { }
+    }
+    // Query Nakama's storage table directly for user profiles
+    var rows = nk.sqlQuery("SELECT user_id, value->>'username' AS username, (value->>'total_points')::int AS total_points\n         FROM storage\n         WHERE collection = $1 AND key = $2\n           AND (value->>'total_points')::int > 0\n         ORDER BY (value->>'total_points')::int DESC\n         LIMIT $3", [COLLECTION_USERS, KEY_PROFILE, limit]);
+    var board = rows.map(function (r, i) { return ({
+        rank: i + 1,
+        user_id: r['user_id'],
+        username: r['username'],
+        total_points: r['total_points'],
+    }); });
+    return JSON.stringify(board);
+}
 function InitModule(ctx, logger, nk, initializer) {
     // ── User endpoints (require Bearer token) ────────────────────────────────
     // GET  /v2/rpc/users-me
@@ -294,17 +729,45 @@ function InitModule(ctx, logger, nk, initializer) {
     initializer.registerRpc('users-me-points', rpcAddUserPoints);
     // POST /v2/rpc/users-by-id  { "user_id": "..." }
     initializer.registerRpc('users-by-id', rpcGetUserProfileById);
-    // ── Achievement endpoints ─────────────────────────────────────────────────
+    // GET  /v2/rpc/users-me-stats
+    initializer.registerRpc('users-me-stats', rpcGetMyStats);
+    // GET  /v2/rpc/users-leaderboard?http_key=<key>  { "limit": 20 }
+    initializer.registerRpc('users-leaderboard', rpcUsersLeaderboard);
+    // ── Custom Achievement endpoints (Nakama storage) ─────────────────────────
     // POST /v2/rpc/achievements-create?http_key=<key>  { game_id, title, description, points, icon }
     initializer.registerRpc('achievements-create', rpcCreateAchievement);
     // POST /v2/rpc/achievements-by-id?http_key=<key>   { "achievement_id": "..." }
     initializer.registerRpc('achievements-by-id', rpcGetAchievement);
     // POST /v2/rpc/achievements-by-game?http_key=<key> { "game_id": "..." }
     initializer.registerRpc('achievements-by-game', rpcListGameAchievements);
-    // ── User-Achievement endpoints (require Bearer token) ─────────────────────
     // POST /v2/rpc/user-achievements-unlock  { "achievement_id": "..." }
     initializer.registerRpc('user-achievements-unlock', rpcUnlockAchievement);
     // GET  /v2/rpc/user-achievements-list
     initializer.registerRpc('user-achievements-list', rpcGetUserAchievements);
+    // ── Games & Consoles (PostgreSQL DB) ──────────────────────────────────────
+    // GET  /v2/rpc/games-consoles?http_key=<key>
+    initializer.registerRpc('games-consoles', rpcListConsoles);
+    // POST /v2/rpc/games-by-console?http_key=<key>  { "console_id": 7, "limit": 50, "offset": 0 }
+    initializer.registerRpc('games-by-console', rpcListGamesByConsole);
+    // POST /v2/rpc/games-by-id?http_key=<key>        { "game_id": 1446 }
+    initializer.registerRpc('games-by-id', rpcGetGameById);
+    // POST /v2/rpc/games-search?http_key=<key>       { "query": "mario", "console_id": 7, "limit": 20 }
+    initializer.registerRpc('games-search', rpcSearchGames);
+    // POST /v2/rpc/games-related?http_key=<key>      { "game_id": 1446 }
+    initializer.registerRpc('games-related', rpcGetRelatedGames);
+    // ── RetroAchievements (PostgreSQL DB) ─────────────────────────────────────
+    // POST /v2/rpc/ra-achievements-by-game?http_key=<key>  { "game_id": 1446, "console_id": 7 }
+    initializer.registerRpc('ra-achievements-by-game', rpcListRAGAchievementsByGame);
+    // POST /v2/rpc/ra-achievements-by-id?http_key=<key>    { "achievement_id": 3159, "console_id": 7 }
+    initializer.registerRpc('ra-achievements-by-id', rpcGetRAAchievementById);
+    // POST /v2/rpc/ra-achievements-unlock  (Bearer token)  { "achievement_id": 3159, "console_id": 7 }
+    initializer.registerRpc('ra-achievements-unlock', rpcUnlockRAAchievement);
+    // GET  /v2/rpc/ra-achievements-list  (Bearer token)    { "limit": 50, "cursor": "..." }
+    initializer.registerRpc('ra-achievements-list', rpcListMyRAAchievements);
+    // ── ROMs (PostgreSQL DB) ──────────────────────────────────────────────────
+    // POST /v2/rpc/roms-by-md5?http_key=<key>     { "md5": "...", "console_id": 7 }
+    initializer.registerRpc('roms-by-md5', rpcGetRomByMd5);
+    // POST /v2/rpc/roms-by-game?http_key=<key>    { "game_id": 1446, "console_id": 7 }
+    initializer.registerRpc('roms-by-game', rpcListRomsByGame);
     logger.info('Retro Achievement module loaded.');
 }

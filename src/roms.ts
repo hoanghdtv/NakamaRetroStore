@@ -2,14 +2,18 @@
 
 // ─── RPC: Look up game by ROM MD5 hash ───────────────────────────────────────
 // POST /v2/rpc/roms-by-md5?http_key=<key>
-// Payload: { "md5": "8e3630186e35d477231bf8fd50e54cdd", "console_id": 7 }
-// If console_id is omitted, searches all platform tables (slower).
+// Payload: { "md5": "8e3630186e35d477231bf8fd50e54cdd" }
+// Tuỳ chọn thêm "console_id" để tìm nhanh hơn trong một platform.
 function rpcGetRomByMd5(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkruntime.Nakama, payload: string): string {
     let req: { md5: string; console_id?: number };
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
     if (!req.md5 || req.md5.trim() === '') throw new Error('md5 is required');
 
     const md5Lower = req.md5.trim().toLowerCase();
+
+    const ck = CK.romByMd5(md5Lower);
+    const hit = cache.get<RARom>(ck);
+    if (hit) return JSON.stringify(hit);
 
     let prefixes: string[];
     if (req.console_id) {
@@ -18,33 +22,38 @@ function rpcGetRomByMd5(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
         prefixes = ALL_PREFIXES;
     }
 
-    const unionParts = prefixes.map(p =>
+    const unionParts = prefixes.map((p: string) =>
         `SELECT gameid, gametitle, md5, romname, labels, patchurl, region
          FROM ${p}_md5 WHERE LOWER(md5) = $1`
     );
     const rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [md5Lower]);
     if (rows.length === 0) throw new Error('ROM not found');
 
-    return JSON.stringify(rowToRom(rows[0]));
+    const rom = rowToRom(rows[0]);
+    cache.set(ck, rom, TTL_ROMS_BY_MD5);
+    return JSON.stringify(rom);
 }
 
 // ─── RPC: List ROMs for a game ────────────────────────────────────────────────
 // POST /v2/rpc/roms-by-game?http_key=<key>
-// Payload: { "game_id": 1446, "console_id": 7 }
+// Payload: { "game_id": 1446 }
 function rpcListRomsByGame(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkruntime.Nakama, payload: string): string {
-    let req: { game_id: number; console_id: number };
+    let req: { game_id: number };
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
-    if (!req.game_id)    throw new Error('game_id is required');
-    if (!req.console_id) throw new Error('console_id is required');
+    if (!req.game_id) throw new Error('game_id is required');
 
-    const prefix = requirePrefix(req.console_id);
-    const rows = nk.sqlQuery(
+    const ck = CK.romsByGame(req.game_id);
+    const hit = cache.get<RARom[]>(ck);
+    if (hit) return JSON.stringify(hit);
+
+    const unionParts = ALL_PREFIXES.map((p: string) =>
         `SELECT gameid, gametitle, md5, romname, labels, patchurl, region
-         FROM ${prefix}_md5 WHERE gameid = $1`,
-        [req.game_id]
+         FROM ${p}_md5 WHERE gameid = $1`
     );
-
-    return JSON.stringify(rows.map(rowToRom));
+    const rows = nk.sqlQuery(unionParts.join(' UNION ALL '), [req.game_id]);
+    const result = rows.map(rowToRom);
+    cache.set(ck, result, TTL_ROMS_BY_GAME);
+    return JSON.stringify(result);
 }
 
 // ─── RPC: Leaderboard (top users by total_points) ─────────────────────────────

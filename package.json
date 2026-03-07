@@ -23,6 +23,8 @@
     "nakama-runtime": "github:heroiclabs/nakama-common#master"
   },
   "devDependencies": {
+    "@types/node": "^25.3.5",
+    "ts-node": "^10.9.2",
     "typescript": "^4.5.4"
   }
 }

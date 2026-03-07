@@ -20,6 +20,9 @@ const CONSOLE_PREFIX: Record<number, string> = {
 /** All known prefixes (for cross-platform UNION queries) */
 const ALL_PREFIXES: string[] = [1, 2, 3, 5, 6, 7, 12, 16, 18, 27, 41].map((id: number) => CONSOLE_PREFIX[id]);
 
+/** Separate collection for RA unlocks — tránh lẫn với custom achievements */
+const COLLECTION_RA_USER_ACHIEVEMENTS = 'ra_user_achievements';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface RAConsole {
@@ -143,6 +146,10 @@ function rowToRom(r: {[k: string]: any}): RARom {
 // ─── RPC: List all consoles ───────────────────────────────────────────────────
 // GET /v2/rpc/games-consoles?http_key=<key>
 function rpcListConsoles(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkruntime.Nakama, payload: string): string {
+    const ck = CK.consoles();
+    const hit = cache.get<RAConsole[]>(ck);
+    if (hit) return JSON.stringify(hit);
+
     const rows = nk.sqlQuery('SELECT id, name, "iconurl" AS iconurl, active, "isgamesystem" AS isgamesystem FROM ra_consoles ORDER BY id', []);
     const consoles: RAConsole[] = rows.map(r => ({
         id:           r['id'],
@@ -151,6 +158,7 @@ function rpcListConsoles(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: n
         active:       r['active'],
         isGameSystem: r['isgamesystem'],
     }));
+    cache.set(ck, consoles, TTL_CONSOLES);
     return JSON.stringify(consoles);
 }
 
@@ -166,6 +174,10 @@ function rpcListGamesByConsole(ctx: nkruntime.Context, logger: nkruntime.Logger,
     const limit  = Math.min(req.limit ?? 50, 200);
     const offset = req.offset ?? 0;
 
+    const ck = CK.gamesByConsole(req.console_id, limit, offset);
+    const hit = cache.get<RAGame[]>(ck);
+    if (hit) return JSON.stringify(hit);
+
     const rows = nk.sqlQuery(
         `SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points, genre, developer, publisher, released, icon, boxart, rating
          FROM ${prefix}_games
@@ -173,8 +185,9 @@ function rpcListGamesByConsole(ctx: nkruntime.Context, logger: nkruntime.Logger,
          LIMIT $1 OFFSET $2`,
         [limit, offset]
     );
-
-    return JSON.stringify(rows.map(rowToGame));
+    const result = rows.map(rowToGame);
+    cache.set(ck, result, TTL_GAMES_BY_CONSOLE);
+    return JSON.stringify(result);
 }
 
 // ─── RPC: Get game by ID (searches across all platforms) ─────────────────────
@@ -185,6 +198,10 @@ function rpcGetGameById(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
     if (!req.game_id) throw new Error('game_id is required');
 
+    const ck = CK.gameById(req.game_id);
+    const hit = cache.get<RAGame>(ck);
+    if (hit) return JSON.stringify(hit);
+
     const unionParts = ALL_PREFIXES.map((p: string) =>
         `SELECT rank, id, title, consolename, consoleid, totalplayers, casualplayers, hardcoreplayers,
                 numachievements, points, genre, developer, publisher, released, description,
@@ -194,7 +211,9 @@ function rpcGetGameById(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
     const rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [req.game_id]);
     if (rows.length === 0) throw new Error('Game not found');
 
-    return JSON.stringify(rowToGame(rows[0]));
+    const game = rowToGame(rows[0]);
+    cache.set(ck, game, TTL_GAME_BY_ID);
+    return JSON.stringify(game);
 }
 
 // ─── RPC: Search games by title ───────────────────────────────────────────────
@@ -206,7 +225,12 @@ function rpcSearchGames(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
     if (!req.query || req.query.trim() === '') throw new Error('query is required');
 
     const limit   = Math.min(req.limit ?? 20, 100);
-    const pattern = `%${req.query.trim()}%`;
+    const q       = req.query.trim().toLowerCase();
+    const pattern = `%${q}%`;
+
+    const ck = CK.gamesSearch(q, req.console_id, limit);
+    const hit = cache.get<RAGame[]>(ck);
+    if (hit) return JSON.stringify(hit);
 
     let prefixes: string[];
     if (req.console_id) {
@@ -225,8 +249,9 @@ function rpcSearchGames(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
         unionParts.join(' UNION ALL ') + ` ORDER BY rank LIMIT $2`,
         [pattern, limit]
     );
-
-    return JSON.stringify(rows.map(rowToGame));
+    const result = rows.map(rowToGame);
+    cache.set(ck, result, TTL_GAMES_SEARCH);
+    return JSON.stringify(result);
 }
 
 // ─── RPC: Get related games ───────────────────────────────────────────────────
@@ -236,6 +261,10 @@ function rpcGetRelatedGames(ctx: nkruntime.Context, logger: nkruntime.Logger, nk
     let req: { game_id: number };
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
     if (!req.game_id) throw new Error('game_id is required');
+
+    const ck = CK.gamesRelated(req.game_id);
+    const hit = cache.get<RAGame[]>(ck);
+    if (hit) return JSON.stringify(hit);
 
     const relRows = nk.sqlQuery('SELECT related FROM related_roms WHERE id = $1 LIMIT 1', [req.game_id]);
     if (relRows.length === 0 || !relRows[0]['related']) return JSON.stringify([]);
@@ -248,14 +277,16 @@ function rpcGetRelatedGames(ctx: nkruntime.Context, logger: nkruntime.Logger, nk
     if (relatedIds.length === 0) return JSON.stringify([]);
 
     const placeholders = relatedIds.map((_, i) => `$${i + 1}`).join(', ');
-    const unionParts = ALL_PREFIXES.map(p =>
+    const unionParts = ALL_PREFIXES.map((p: string) =>
         `SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,
                 genre, developer, publisher, released, icon, boxart, rating
          FROM ${p}_games WHERE id IN (${placeholders})`
     );
 
     const rows = nk.sqlQuery(unionParts.join(' UNION ALL '), relatedIds);
-    return JSON.stringify(rows.map(rowToGame));
+    const result = rows.map(rowToGame);
+    cache.set(ck, result, TTL_GAMES_RELATED);
+    return JSON.stringify(result);
 }
 
 // ─── RPC: List RA achievements by game ───────────────────────────────────────
@@ -282,43 +313,47 @@ function rpcListRAGAchievementsByGame(ctx: nkruntime.Context, logger: nkruntime.
 
 // ─── RPC: Get single RA achievement by ID ────────────────────────────────────
 // POST /v2/rpc/ra-achievements-by-id?http_key=<key>
-// Payload: { "achievement_id": 3159, "console_id": 7 }
+// Payload: { "achievement_id": 3159 }
 function rpcGetRAAchievementById(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkruntime.Nakama, payload: string): string {
-    let req: { achievement_id: number; console_id: number };
+    let req: { achievement_id: number };
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
     if (!req.achievement_id) throw new Error('achievement_id is required');
-    if (!req.console_id)     throw new Error('console_id is required');
 
-    const prefix = requirePrefix(req.console_id);
-    const rows = nk.sqlQuery(
+    const ck = CK.achById(req.achievement_id);
+    const hit = cache.get<RAAchievement>(ck);
+    if (hit) return JSON.stringify(hit);
+
+    const unionParts = ALL_PREFIXES.map((p: string) =>
         `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
                 type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
-         FROM ${prefix}_achievements
-         WHERE achievementid = $1
-         LIMIT 1`,
+         FROM ${p}_achievements WHERE achievementid = $1`
+    );
+    const rows = nk.sqlQuery(
+        unionParts.join(' UNION ALL ') + ' LIMIT 1',
         [req.achievement_id]
     );
     if (rows.length === 0) throw new Error('Achievement not found');
 
-    return JSON.stringify(rowToAchievement(rows[0]));
+    const ach = rowToAchievement(rows[0]);
+    cache.set(ck, ach, TTL_ACH_BY_ID);
+    return JSON.stringify(ach);
 }
 
 // ─── RPC: Unlock a RetroAchievement (adds points to user profile) ─────────────
 // POST /v2/rpc/ra-achievements-unlock
 // Authorization: Bearer <token>
-// Payload: { "achievement_id": 3159, "console_id": 7 }
+// Payload: { "achievement_id": 3159 }
 function rpcUnlockRAAchievement(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkruntime.Nakama, payload: string): string {
     if (!ctx.userId) throw new Error('Authentication required');
 
-    let req: { achievement_id: number; console_id: number };
+    let req: { achievement_id: number };
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
     if (!req.achievement_id) throw new Error('achievement_id is required');
-    if (!req.console_id)     throw new Error('console_id is required');
 
     // Check if already unlocked in Nakama storage
-    const lockKey  = `ra_${req.achievement_id}`;
+    const lockKey  = `${req.achievement_id}`;
     const existing = nk.storageRead([{
-        collection: COLLECTION_USER_ACHIEVEMENTS,
+        collection: COLLECTION_RA_USER_ACHIEVEMENTS,
         key:        lockKey,
         userId:     ctx.userId,
     }]);
@@ -328,13 +363,12 @@ function rpcUnlockRAAchievement(ctx: nkruntime.Context, logger: nkruntime.Logger
         return JSON.stringify({ already_unlocked: true, unlocked_at: ua.unlocked_at, points_earned: ua.points_earned });
     }
 
-    // Fetch achievement from DB to get points
-    const prefix = requirePrefix(req.console_id);
-    const achRows = nk.sqlQuery(
+    // Fetch achievement from DB (search across all platforms)
+    const achUnion = ALL_PREFIXES.map((p: string) =>
         `SELECT achievementid, title, points, gameid, gametitle, badgeurl
-         FROM ${prefix}_achievements WHERE achievementid = $1 LIMIT 1`,
-        [req.achievement_id]
-    );
+         FROM ${p}_achievements WHERE achievementid = $1`
+    ).join(' UNION ALL ');
+    const achRows = nk.sqlQuery(achUnion + ' LIMIT 1', [req.achievement_id]);
     if (achRows.length === 0) throw new Error('Achievement not found');
 
     const achRow      = achRows[0];
@@ -343,42 +377,38 @@ function rpcUnlockRAAchievement(ctx: nkruntime.Context, logger: nkruntime.Logger
 
     // Write unlock record
     nk.storageWrite([{
-        collection:      COLLECTION_USER_ACHIEVEMENTS,
+        collection:      COLLECTION_RA_USER_ACHIEVEMENTS,
         key:             lockKey,
         userId:          ctx.userId,
         value: {
-            achievement_id:   req.achievement_id,
+            achievement_id:    req.achievement_id,
             achievement_title: achRow['title'],
-            game_id:          achRow['gameid'],
-            game_title:       achRow['gametitle'],
-            badge_url:        achRow['badgeurl'],
-            points_earned:    pointsEarned,
-            unlocked_at:      unlockedAt,
+            game_id:           achRow['gameid'],
+            game_title:        achRow['gametitle'],
+            badge_url:         achRow['badgeurl'],
+            points_earned:     pointsEarned,
+            unlocked_at:       unlockedAt,
         },
         permissionRead:  2,
         permissionWrite: 0,
     }]);
 
-    // Add points to user profile
+    // Add points to user profile — reuse helper từ users.ts
     if (pointsEarned > 0) {
-        const profileObjs = nk.storageRead([{ collection: COLLECTION_USERS, key: KEY_PROFILE, userId: ctx.userId }]);
-        let profile: any = profileObjs.length > 0 ? profileObjs[0].value : null;
+        let profile = storageGetProfile(nk, ctx.userId);
         if (!profile) {
             const account = nk.accountGetId(ctx.userId);
             const user = account.user!;
             profile = {
-                id: ctx.userId,
-                username: user.username ?? '',
-                email: account.email ?? '',
-                created_at: Math.floor(new Date(user.createTime!).getTime() / 1000),
+                id:           ctx.userId,
+                username:     user.username ?? '',
+                email:        account.email ?? '',
+                created_at:   Math.floor(new Date(user.createTime!).getTime() / 1000),
                 total_points: 0,
             };
         }
-        profile.total_points = (profile.total_points ?? 0) + pointsEarned;
-        nk.storageWrite([{
-            collection: COLLECTION_USERS, key: KEY_PROFILE, userId: ctx.userId,
-            value: profile, permissionRead: 2, permissionWrite: 0,
-        }]);
+        profile.total_points += pointsEarned;
+        storageUpsertProfile(nk, ctx.userId, profile);
     }
 
     logger.info('User %s unlocked RA achievement %d (+%d pts)', ctx.userId, req.achievement_id, pointsEarned);
@@ -409,7 +439,7 @@ function rpcListMyRAAchievements(ctx: nkruntime.Context, logger: nkruntime.Logge
         } catch (_) {}
     }
 
-    const result = nk.storageList(ctx.userId, COLLECTION_USER_ACHIEVEMENTS, limit, cursor);
+    const result = nk.storageList(ctx.userId, COLLECTION_RA_USER_ACHIEVEMENTS, limit, cursor);
     const unlocks = (result.objects || []).map((o: nkruntime.StorageObject) => o.value);
 
     return JSON.stringify({ unlocks, cursor: result.cursor });
@@ -425,7 +455,7 @@ function rpcGetMyStats(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkr
     let totalUnlocked = 0;
     let cursor: string | undefined;
     do {
-        const page = nk.storageList(ctx.userId, COLLECTION_USER_ACHIEVEMENTS, 200, cursor);
+        const page = nk.storageList(ctx.userId, COLLECTION_RA_USER_ACHIEVEMENTS, 200, cursor);
         totalUnlocked += (page.objects || []).length;
         cursor = page.cursor;
     } while (cursor);

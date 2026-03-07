@@ -286,6 +286,80 @@ function rpcGetUserAchievements(ctx, logger, nk, payload) {
     var userAchs = ((_a = result.objects) !== null && _a !== void 0 ? _a : []).map(function (o) { return o.value; });
     return JSON.stringify(userAchs);
 }
+/**
+ * Simple in-memory TTL cache cho Nakama JS runtime.
+ *
+ * Nakama JS runtime là long-lived single process (không restart theo request)
+ * nên module-level Map tồn tại suốt vòng đời server — hoàn toàn phù hợp
+ * để cache dữ liệu read-heavy như games, achievements, ROMs.
+ *
+ * TTL guidelines:
+ *   - Dữ liệu DB tĩnh (games, achievements, ROMs) : 60–120 phút
+ *   - Leaderboard / stats                          : KHÔNG cache (real-time)
+ *   - User profile / unlocks                       : KHÔNG cache (thay đổi thường xuyên)
+ */
+var TtlCache = /** @class */ (function () {
+    function TtlCache() {
+        this.store = new Map();
+    }
+    /** Lấy giá trị từ cache; trả về undefined nếu miss hoặc hết hạn */
+    TtlCache.prototype.get = function (key) {
+        var entry = this.store.get(key);
+        if (!entry)
+            return undefined;
+        if (Date.now() > entry.expiresAt) {
+            this.store.delete(key);
+            return undefined;
+        }
+        return entry.value;
+    };
+    /** Lưu giá trị với TTL (giây) */
+    TtlCache.prototype.set = function (key, value, ttlSec) {
+        this.store.set(key, { value: value, expiresAt: Date.now() + ttlSec * 1000 });
+    };
+    /** Xoá một key */
+    TtlCache.prototype.del = function (key) {
+        this.store.delete(key);
+    };
+    /** Xoá tất cả entry đã hết hạn (gọi định kỳ để tránh memory leak) */
+    TtlCache.prototype.purgeExpired = function () {
+        var _this = this;
+        var now = Date.now();
+        this.store.forEach(function (entry, key) {
+            if (now > entry.expiresAt)
+                _this.store.delete(key);
+        });
+    };
+    /** Số entry hiện tại trong cache */
+    TtlCache.prototype.size = function () {
+        return this.store.size;
+    };
+    return TtlCache;
+}());
+// Singleton — dùng chung cho toàn bộ module
+var cache = new TtlCache();
+// ─── TTL constants (giây) ─────────────────────────────────────────────────────
+var TTL_CONSOLES = 24 * 3600; // ra_consoles không đổi
+var TTL_GAME_BY_ID = 2 * 3600;
+var TTL_GAMES_BY_CONSOLE = 1 * 3600;
+var TTL_GAMES_SEARCH = 30 * 60; // search query đa dạng → TTL ngắn hơn
+var TTL_GAMES_RELATED = 2 * 3600;
+var TTL_ACH_BY_GAME = 2 * 3600;
+var TTL_ACH_BY_ID = 2 * 3600;
+var TTL_ROMS_BY_GAME = 4 * 3600;
+var TTL_ROMS_BY_MD5 = 4 * 3600;
+// ─── Cache key builders ───────────────────────────────────────────────────────
+var CK = {
+    consoles: function () { return 'consoles'; },
+    gameById: function (id) { return "game:".concat(id); },
+    gamesByConsole: function (cid, lim, off) { return "games:".concat(cid, ":").concat(lim, ":").concat(off); },
+    gamesSearch: function (q, cid, lim) { return "search:".concat(q, ":").concat(cid !== null && cid !== void 0 ? cid : 'all', ":").concat(lim); },
+    gamesRelated: function (id) { return "related:".concat(id); },
+    achByGame: function (id) { return "ach_game:".concat(id); },
+    achById: function (id) { return "ach:".concat(id); },
+    romsByGame: function (id) { return "roms_game:".concat(id); },
+    romByMd5: function (md5) { return "rom_md5:".concat(md5.toLowerCase()); },
+};
 // Games & RA-Achievements module — queries PostgreSQL tables populated from db/*.sql dumps
 // ─── Console → table prefix mapping ──────────────────────────────────────────
 /** Maps RetroAchievements consoleId → SQL table prefix */
@@ -304,6 +378,8 @@ var CONSOLE_PREFIX = {
 };
 /** All known prefixes (for cross-platform UNION queries) */
 var ALL_PREFIXES = [1, 2, 3, 5, 6, 7, 12, 16, 18, 27, 41].map(function (id) { return CONSOLE_PREFIX[id]; });
+/** Separate collection for RA unlocks — tránh lẫn với custom achievements */
+var COLLECTION_RA_USER_ACHIEVEMENTS = 'ra_user_achievements';
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function requirePrefix(consoleId) {
     var p = CONSOLE_PREFIX[consoleId];
@@ -367,6 +443,10 @@ function rowToRom(r) {
 // ─── RPC: List all consoles ───────────────────────────────────────────────────
 // GET /v2/rpc/games-consoles?http_key=<key>
 function rpcListConsoles(ctx, logger, nk, payload) {
+    var ck = CK.consoles();
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
     var rows = nk.sqlQuery('SELECT id, name, "iconurl" AS iconurl, active, "isgamesystem" AS isgamesystem FROM ra_consoles ORDER BY id', []);
     var consoles = rows.map(function (r) { return ({
         id: r['id'],
@@ -375,6 +455,7 @@ function rpcListConsoles(ctx, logger, nk, payload) {
         active: r['active'],
         isGameSystem: r['isgamesystem'],
     }); });
+    cache.set(ck, consoles, TTL_CONSOLES);
     return JSON.stringify(consoles);
 }
 // ─── RPC: List games by console ───────────────────────────────────────────────
@@ -394,8 +475,14 @@ function rpcListGamesByConsole(ctx, logger, nk, payload) {
     var prefix = requirePrefix(req.console_id);
     var limit = Math.min((_a = req.limit) !== null && _a !== void 0 ? _a : 50, 200);
     var offset = (_b = req.offset) !== null && _b !== void 0 ? _b : 0;
+    var ck = CK.gamesByConsole(req.console_id, limit, offset);
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
     var rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points, genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(prefix, "_games\n         ORDER BY rank\n         LIMIT $1 OFFSET $2"), [limit, offset]);
-    return JSON.stringify(rows.map(rowToGame));
+    var result = rows.map(rowToGame);
+    cache.set(ck, result, TTL_GAMES_BY_CONSOLE);
+    return JSON.stringify(result);
 }
 // ─── RPC: Get game by ID (searches across all platforms) ─────────────────────
 // POST /v2/rpc/games-by-id?http_key=<key>
@@ -410,13 +497,19 @@ function rpcGetGameById(ctx, logger, nk, payload) {
     }
     if (!req.game_id)
         throw new Error('game_id is required');
+    var ck = CK.gameById(req.game_id);
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
     var unionParts = ALL_PREFIXES.map(function (p) {
         return "SELECT rank, id, title, consolename, consoleid, totalplayers, casualplayers, hardcoreplayers,\n                numachievements, points, genre, developer, publisher, released, description,\n                icon, boxart, titlescreen, screenshot, rating\n         FROM ".concat(p, "_games WHERE id = $1");
     });
     var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [req.game_id]);
     if (rows.length === 0)
         throw new Error('Game not found');
-    return JSON.stringify(rowToGame(rows[0]));
+    var game = rowToGame(rows[0]);
+    cache.set(ck, game, TTL_GAME_BY_ID);
+    return JSON.stringify(game);
 }
 // ─── RPC: Search games by title ───────────────────────────────────────────────
 // POST /v2/rpc/games-search?http_key=<key>
@@ -433,7 +526,12 @@ function rpcSearchGames(ctx, logger, nk, payload) {
     if (!req.query || req.query.trim() === '')
         throw new Error('query is required');
     var limit = Math.min((_a = req.limit) !== null && _a !== void 0 ? _a : 20, 100);
-    var pattern = "%".concat(req.query.trim(), "%");
+    var q = req.query.trim().toLowerCase();
+    var pattern = "%".concat(q, "%");
+    var ck = CK.gamesSearch(q, req.console_id, limit);
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
     var prefixes;
     if (req.console_id) {
         prefixes = [requirePrefix(req.console_id)];
@@ -445,7 +543,9 @@ function rpcSearchGames(ctx, logger, nk, payload) {
         return "SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(p, "_games WHERE LOWER(title) LIKE LOWER($1)");
     });
     var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + " ORDER BY rank LIMIT $2", [pattern, limit]);
-    return JSON.stringify(rows.map(rowToGame));
+    var result = rows.map(rowToGame);
+    cache.set(ck, result, TTL_GAMES_SEARCH);
+    return JSON.stringify(result);
 }
 // ─── RPC: Get related games ───────────────────────────────────────────────────
 // POST /v2/rpc/games-related?http_key=<key>
@@ -460,6 +560,10 @@ function rpcGetRelatedGames(ctx, logger, nk, payload) {
     }
     if (!req.game_id)
         throw new Error('game_id is required');
+    var ck = CK.gamesRelated(req.game_id);
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
     var relRows = nk.sqlQuery('SELECT related FROM related_roms WHERE id = $1 LIMIT 1', [req.game_id]);
     if (relRows.length === 0 || !relRows[0]['related'])
         return JSON.stringify([]);
@@ -474,7 +578,9 @@ function rpcGetRelatedGames(ctx, logger, nk, payload) {
         return "SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(p, "_games WHERE id IN (").concat(placeholders, ")");
     });
     var rows = nk.sqlQuery(unionParts.join(' UNION ALL '), relatedIds);
-    return JSON.stringify(rows.map(rowToGame));
+    var result = rows.map(rowToGame);
+    cache.set(ck, result, TTL_GAMES_RELATED);
+    return JSON.stringify(result);
 }
 // ─── RPC: List RA achievements by game ───────────────────────────────────────
 // POST /v2/rpc/ra-achievements-by-game?http_key=<key>
@@ -497,7 +603,7 @@ function rpcListRAGAchievementsByGame(ctx, logger, nk, payload) {
 }
 // ─── RPC: Get single RA achievement by ID ────────────────────────────────────
 // POST /v2/rpc/ra-achievements-by-id?http_key=<key>
-// Payload: { "achievement_id": 3159, "console_id": 7 }
+// Payload: { "achievement_id": 3159 }
 function rpcGetRAAchievementById(ctx, logger, nk, payload) {
     var req;
     try {
@@ -508,20 +614,26 @@ function rpcGetRAAchievementById(ctx, logger, nk, payload) {
     }
     if (!req.achievement_id)
         throw new Error('achievement_id is required');
-    if (!req.console_id)
-        throw new Error('console_id is required');
-    var prefix = requirePrefix(req.console_id);
-    var rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM ".concat(prefix, "_achievements\n         WHERE achievementid = $1\n         LIMIT 1"), [req.achievement_id]);
+    var ck = CK.achById(req.achievement_id);
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
+    var unionParts = ALL_PREFIXES.map(function (p) {
+        return "SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM ".concat(p, "_achievements WHERE achievementid = $1");
+    });
+    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [req.achievement_id]);
     if (rows.length === 0)
         throw new Error('Achievement not found');
-    return JSON.stringify(rowToAchievement(rows[0]));
+    var ach = rowToAchievement(rows[0]);
+    cache.set(ck, ach, TTL_ACH_BY_ID);
+    return JSON.stringify(ach);
 }
 // ─── RPC: Unlock a RetroAchievement (adds points to user profile) ─────────────
 // POST /v2/rpc/ra-achievements-unlock
 // Authorization: Bearer <token>
-// Payload: { "achievement_id": 3159, "console_id": 7 }
+// Payload: { "achievement_id": 3159 }
 function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
-    var _a, _b, _c, _d;
+    var _a, _b, _c;
     if (!ctx.userId)
         throw new Error('Authentication required');
     var req;
@@ -533,12 +645,10 @@ function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
     }
     if (!req.achievement_id)
         throw new Error('achievement_id is required');
-    if (!req.console_id)
-        throw new Error('console_id is required');
     // Check if already unlocked in Nakama storage
-    var lockKey = "ra_".concat(req.achievement_id);
+    var lockKey = "".concat(req.achievement_id);
     var existing = nk.storageRead([{
-            collection: COLLECTION_USER_ACHIEVEMENTS,
+            collection: COLLECTION_RA_USER_ACHIEVEMENTS,
             key: lockKey,
             userId: ctx.userId,
         }]);
@@ -546,9 +656,11 @@ function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
         var ua = existing[0].value;
         return JSON.stringify({ already_unlocked: true, unlocked_at: ua.unlocked_at, points_earned: ua.points_earned });
     }
-    // Fetch achievement from DB to get points
-    var prefix = requirePrefix(req.console_id);
-    var achRows = nk.sqlQuery("SELECT achievementid, title, points, gameid, gametitle, badgeurl\n         FROM ".concat(prefix, "_achievements WHERE achievementid = $1 LIMIT 1"), [req.achievement_id]);
+    // Fetch achievement from DB (search across all platforms)
+    var achUnion = ALL_PREFIXES.map(function (p) {
+        return "SELECT achievementid, title, points, gameid, gametitle, badgeurl\n         FROM ".concat(p, "_achievements WHERE achievementid = $1");
+    }).join(' UNION ALL ');
+    var achRows = nk.sqlQuery(achUnion + ' LIMIT 1', [req.achievement_id]);
     if (achRows.length === 0)
         throw new Error('Achievement not found');
     var achRow = achRows[0];
@@ -556,7 +668,7 @@ function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
     var unlockedAt = Math.floor(Date.now() / 1000);
     // Write unlock record
     nk.storageWrite([{
-            collection: COLLECTION_USER_ACHIEVEMENTS,
+            collection: COLLECTION_RA_USER_ACHIEVEMENTS,
             key: lockKey,
             userId: ctx.userId,
             value: {
@@ -571,10 +683,9 @@ function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
             permissionRead: 2,
             permissionWrite: 0,
         }]);
-    // Add points to user profile
+    // Add points to user profile — reuse helper từ users.ts
     if (pointsEarned > 0) {
-        var profileObjs = nk.storageRead([{ collection: COLLECTION_USERS, key: KEY_PROFILE, userId: ctx.userId }]);
-        var profile = profileObjs.length > 0 ? profileObjs[0].value : null;
+        var profile = storageGetProfile(nk, ctx.userId);
         if (!profile) {
             var account = nk.accountGetId(ctx.userId);
             var user = account.user;
@@ -586,11 +697,8 @@ function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
                 total_points: 0,
             };
         }
-        profile.total_points = ((_d = profile.total_points) !== null && _d !== void 0 ? _d : 0) + pointsEarned;
-        nk.storageWrite([{
-                collection: COLLECTION_USERS, key: KEY_PROFILE, userId: ctx.userId,
-                value: profile, permissionRead: 2, permissionWrite: 0,
-            }]);
+        profile.total_points += pointsEarned;
+        storageUpsertProfile(nk, ctx.userId, profile);
     }
     logger.info('User %s unlocked RA achievement %d (+%d pts)', ctx.userId, req.achievement_id, pointsEarned);
     return JSON.stringify({
@@ -620,7 +728,7 @@ function rpcListMyRAAchievements(ctx, logger, nk, payload) {
         }
         catch (_) { }
     }
-    var result = nk.storageList(ctx.userId, COLLECTION_USER_ACHIEVEMENTS, limit, cursor);
+    var result = nk.storageList(ctx.userId, COLLECTION_RA_USER_ACHIEVEMENTS, limit, cursor);
     var unlocks = (result.objects || []).map(function (o) { return o.value; });
     return JSON.stringify({ unlocks: unlocks, cursor: result.cursor });
 }
@@ -635,7 +743,7 @@ function rpcGetMyStats(ctx, logger, nk, payload) {
     var totalUnlocked = 0;
     var cursor;
     do {
-        var page = nk.storageList(ctx.userId, COLLECTION_USER_ACHIEVEMENTS, 200, cursor);
+        var page = nk.storageList(ctx.userId, COLLECTION_RA_USER_ACHIEVEMENTS, 200, cursor);
         totalUnlocked += (page.objects || []).length;
         cursor = page.cursor;
     } while (cursor);
@@ -651,8 +759,8 @@ function rpcGetMyStats(ctx, logger, nk, payload) {
 // ROMs & Leaderboard module
 // ─── RPC: Look up game by ROM MD5 hash ───────────────────────────────────────
 // POST /v2/rpc/roms-by-md5?http_key=<key>
-// Payload: { "md5": "8e3630186e35d477231bf8fd50e54cdd", "console_id": 7 }
-// If console_id is omitted, searches all platform tables (slower).
+// Payload: { "md5": "8e3630186e35d477231bf8fd50e54cdd" }
+// Tuỳ chọn thêm "console_id" để tìm nhanh hơn trong một platform.
 function rpcGetRomByMd5(ctx, logger, nk, payload) {
     var req;
     try {
@@ -664,6 +772,10 @@ function rpcGetRomByMd5(ctx, logger, nk, payload) {
     if (!req.md5 || req.md5.trim() === '')
         throw new Error('md5 is required');
     var md5Lower = req.md5.trim().toLowerCase();
+    var ck = CK.romByMd5(md5Lower);
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
     var prefixes;
     if (req.console_id) {
         prefixes = [requirePrefix(req.console_id)];
@@ -677,11 +789,13 @@ function rpcGetRomByMd5(ctx, logger, nk, payload) {
     var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [md5Lower]);
     if (rows.length === 0)
         throw new Error('ROM not found');
-    return JSON.stringify(rowToRom(rows[0]));
+    var rom = rowToRom(rows[0]);
+    cache.set(ck, rom, TTL_ROMS_BY_MD5);
+    return JSON.stringify(rom);
 }
 // ─── RPC: List ROMs for a game ────────────────────────────────────────────────
 // POST /v2/rpc/roms-by-game?http_key=<key>
-// Payload: { "game_id": 1446, "console_id": 7 }
+// Payload: { "game_id": 1446 }
 function rpcListRomsByGame(ctx, logger, nk, payload) {
     var req;
     try {
@@ -692,11 +806,17 @@ function rpcListRomsByGame(ctx, logger, nk, payload) {
     }
     if (!req.game_id)
         throw new Error('game_id is required');
-    if (!req.console_id)
-        throw new Error('console_id is required');
-    var prefix = requirePrefix(req.console_id);
-    var rows = nk.sqlQuery("SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM ".concat(prefix, "_md5 WHERE gameid = $1"), [req.game_id]);
-    return JSON.stringify(rows.map(rowToRom));
+    var ck = CK.romsByGame(req.game_id);
+    var hit = cache.get(ck);
+    if (hit)
+        return JSON.stringify(hit);
+    var unionParts = ALL_PREFIXES.map(function (p) {
+        return "SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM ".concat(p, "_md5 WHERE gameid = $1");
+    });
+    var rows = nk.sqlQuery(unionParts.join(' UNION ALL '), [req.game_id]);
+    var result = rows.map(rowToRom);
+    cache.set(ck, result, TTL_ROMS_BY_GAME);
+    return JSON.stringify(result);
 }
 // ─── RPC: Leaderboard (top users by total_points) ─────────────────────────────
 // GET /v2/rpc/users-leaderboard?http_key=<key>
@@ -756,18 +876,18 @@ function InitModule(ctx, logger, nk, initializer) {
     // POST /v2/rpc/games-related?http_key=<key>      { "game_id": 1446 }
     initializer.registerRpc('games-related', rpcGetRelatedGames);
     // ── RetroAchievements (PostgreSQL DB) ─────────────────────────────────────
-    // POST /v2/rpc/ra-achievements-by-game?http_key=<key>  { "game_id": 1446, "console_id": 7 }
+    // POST /v2/rpc/ra-achievements-by-game?http_key=<key>  { "game_id": 1446 }
     initializer.registerRpc('ra-achievements-by-game', rpcListRAGAchievementsByGame);
-    // POST /v2/rpc/ra-achievements-by-id?http_key=<key>    { "achievement_id": 3159, "console_id": 7 }
+    // POST /v2/rpc/ra-achievements-by-id?http_key=<key>    { "achievement_id": 3159 }
     initializer.registerRpc('ra-achievements-by-id', rpcGetRAAchievementById);
-    // POST /v2/rpc/ra-achievements-unlock  (Bearer token)  { "achievement_id": 3159, "console_id": 7 }
+    // POST /v2/rpc/ra-achievements-unlock  (Bearer token)  { "achievement_id": 3159 }
     initializer.registerRpc('ra-achievements-unlock', rpcUnlockRAAchievement);
-    // GET  /v2/rpc/ra-achievements-list  (Bearer token)    { "limit": 50, "cursor": "..." }
+    // GET  /v2/rpc/ra-achievements-list   (Bearer token)   { "limit": 50, "cursor": "..." }
     initializer.registerRpc('ra-achievements-list', rpcListMyRAAchievements);
     // ── ROMs (PostgreSQL DB) ──────────────────────────────────────────────────
-    // POST /v2/rpc/roms-by-md5?http_key=<key>     { "md5": "...", "console_id": 7 }
+    // POST /v2/rpc/roms-by-md5?http_key=<key>   { "md5": "..." }  — console_id optional để tăng tốc
     initializer.registerRpc('roms-by-md5', rpcGetRomByMd5);
-    // POST /v2/rpc/roms-by-game?http_key=<key>    { "game_id": 1446, "console_id": 7 }
+    // POST /v2/rpc/roms-by-game?http_key=<key>  { "game_id": 1446 }
     initializer.registerRpc('roms-by-game', rpcListRomsByGame);
     logger.info('Retro Achievement module loaded.');
 }

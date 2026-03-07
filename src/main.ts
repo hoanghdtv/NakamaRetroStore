@@ -37,19 +37,19 @@ function InitModule(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkrunt
     initializer.registerRpc('games-related',              rpcGetRelatedGames);
 
     // ── RetroAchievements (PostgreSQL DB) ─────────────────────────────────────
-    // POST /v2/rpc/ra-achievements-by-game?http_key=<key>  { "game_id": 1446, "console_id": 7 }
+    // POST /v2/rpc/ra-achievements-by-game?http_key=<key>  { "game_id": 1446 }
     initializer.registerRpc('ra-achievements-by-game',    rpcListRAGAchievementsByGame);
-    // POST /v2/rpc/ra-achievements-by-id?http_key=<key>    { "achievement_id": 3159, "console_id": 7 }
+    // POST /v2/rpc/ra-achievements-by-id?http_key=<key>    { "achievement_id": 3159 }
     initializer.registerRpc('ra-achievements-by-id',      rpcGetRAAchievementById);
-    // POST /v2/rpc/ra-achievements-unlock  (Bearer token)  { "achievement_id": 3159, "console_id": 7 }
+    // POST /v2/rpc/ra-achievements-unlock  (Bearer token)  { "achievement_id": 3159 }
     initializer.registerRpc('ra-achievements-unlock',     rpcUnlockRAAchievement);
-    // GET  /v2/rpc/ra-achievements-list  (Bearer token)    { "limit": 50, "cursor": "..." }
+    // GET  /v2/rpc/ra-achievements-list   (Bearer token)   { "limit": 50, "cursor": "..." }
     initializer.registerRpc('ra-achievements-list',       rpcListMyRAAchievements);
 
     // ── ROMs (PostgreSQL DB) ──────────────────────────────────────────────────
-    // POST /v2/rpc/roms-by-md5?http_key=<key>     { "md5": "...", "console_id": 7 }
+    // POST /v2/rpc/roms-by-md5?http_key=<key>   { "md5": "..." }  — console_id optional để tăng tốc
     initializer.registerRpc('roms-by-md5',                rpcGetRomByMd5);
-    // POST /v2/rpc/roms-by-game?http_key=<key>    { "game_id": 1446, "console_id": 7 }
+    // POST /v2/rpc/roms-by-game?http_key=<key>  { "game_id": 1446 }
     initializer.registerRpc('roms-by-game',               rpcListRomsByGame);
 
     logger.info('Retro Achievement module loaded.');

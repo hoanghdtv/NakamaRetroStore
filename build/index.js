@@ -595,10 +595,17 @@ function rpcListRAGAchievementsByGame(ctx, logger, nk, payload) {
     }
     if (!req.game_id)
         throw new Error('game_id is required');
-    if (!req.console_id)
-        throw new Error('console_id is required');
-    var prefix = requirePrefix(req.console_id);
-    var rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM ".concat(prefix, "_achievements\n         WHERE gameid = $1\n         ORDER BY displayorder"), [req.game_id]);
+    var rows;
+    if (req.console_id) {
+        var prefix = requirePrefix(req.console_id);
+        rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n             FROM ".concat(prefix, "_achievements\n             WHERE gameid = $1\n             ORDER BY displayorder"), [req.game_id]);
+    }
+    else {
+        var unionParts = ALL_PREFIXES.map(function (p) {
+            return "SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n             FROM ".concat(p, "_achievements WHERE gameid = $1");
+        });
+        rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' ORDER BY displayorder', [req.game_id]);
+    }
     return JSON.stringify(rows.map(rowToAchievement));
 }
 // ─── RPC: Get single RA achievement by ID ────────────────────────────────────

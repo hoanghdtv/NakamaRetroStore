@@ -293,20 +293,32 @@ function rpcGetRelatedGames(ctx: nkruntime.Context, logger: nkruntime.Logger, nk
 // POST /v2/rpc/ra-achievements-by-game?http_key=<key>
 // Payload: { "game_id": 1446, "console_id": 7 }
 function rpcListRAGAchievementsByGame(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nkruntime.Nakama, payload: string): string {
-    let req: { game_id: number; console_id: number };
+    let req: { game_id: number; console_id?: number };
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
-    if (!req.game_id)    throw new Error('game_id is required');
-    if (!req.console_id) throw new Error('console_id is required');
+    if (!req.game_id) throw new Error('game_id is required');
 
-    const prefix = requirePrefix(req.console_id);
-    const rows = nk.sqlQuery(
-        `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
-                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
-         FROM ${prefix}_achievements
-         WHERE gameid = $1
-         ORDER BY displayorder`,
-        [req.game_id]
-    );
+    let rows: nkruntime.SqlQueryResult;
+    if (req.console_id) {
+        const prefix = requirePrefix(req.console_id);
+        rows = nk.sqlQuery(
+            `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
+                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
+             FROM ${prefix}_achievements
+             WHERE gameid = $1
+             ORDER BY displayorder`,
+            [req.game_id]
+        );
+    } else {
+        const unionParts = ALL_PREFIXES.map((p: string) =>
+            `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
+                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
+             FROM ${p}_achievements WHERE gameid = $1`
+        );
+        rows = nk.sqlQuery(
+            unionParts.join(' UNION ALL ') + ' ORDER BY displayorder',
+            [req.game_id]
+        );
+    }
 
     return JSON.stringify(rows.map(rowToAchievement));
 }

@@ -2,12 +2,19 @@
   "files": [
     "src/users.ts",
     "src/achievements.ts",
+    "src/cache.ts",
+    "src/games.ts",
+    "src/roms.ts",
     "src/main.ts"
   ],
   "compilerOptions": {
     "target": "es5",
     "typeRoots": [
       "./node_modules"
+    ],
+    "types": [
+      "nakama-runtime",
+      "node"
     ],
     "outFile": "./build/index.js",
     "strict": true,

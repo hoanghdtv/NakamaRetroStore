@@ -361,31 +361,15 @@ var CK = {
     romByMd5: function (md5) { return "rom_md5:".concat(md5.toLowerCase()); },
 };
 // Games & RA-Achievements module — queries PostgreSQL tables populated from db/*.sql dumps
-// ─── Console → table prefix mapping ──────────────────────────────────────────
-/** Maps RetroAchievements consoleId → SQL table prefix */
-var CONSOLE_PREFIX = {
-    1: 'sega',
-    2: 'n64',
-    3: 'snes',
-    5: 'gba',
-    6: 'gbc',
-    7: 'nes',
-    12: 'psx',
-    16: 'gamecube',
-    18: 'nds',
-    27: 'mame',
-    41: 'psp',
-};
-/** All known prefixes (for cross-platform UNION queries) */
-var ALL_PREFIXES = [1, 2, 3, 5, 6, 7, 12, 16, 18, 27, 41].map(function (id) { return CONSOLE_PREFIX[id]; });
+// ─── Console IDs ─────────────────────────────────────────────────────────────
+/** All known RetroAchievements consoleIds */
+var ALL_CONSOLE_IDS = [1, 2, 3, 5, 6, 7, 12, 16, 18, 27, 41];
 /** Separate collection for RA unlocks — tránh lẫn với custom achievements */
 var COLLECTION_RA_USER_ACHIEVEMENTS = 'ra_user_achievements';
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function requirePrefix(consoleId) {
-    var p = CONSOLE_PREFIX[consoleId];
-    if (!p)
+function assertConsoleId(consoleId) {
+    if (ALL_CONSOLE_IDS.indexOf(consoleId) === -1)
         throw new Error("Unsupported consoleId: ".concat(consoleId));
-    return p;
 }
 function rowToGame(r) {
     var _a, _b, _c, _d, _e;
@@ -472,14 +456,14 @@ function rpcListGamesByConsole(ctx, logger, nk, payload) {
     }
     if (!req.console_id)
         throw new Error('console_id is required');
-    var prefix = requirePrefix(req.console_id);
+    assertConsoleId(req.console_id);
     var limit = Math.min((_a = req.limit) !== null && _a !== void 0 ? _a : 50, 200);
     var offset = (_b = req.offset) !== null && _b !== void 0 ? _b : 0;
     var ck = CK.gamesByConsole(req.console_id, limit, offset);
     var hit = cache.get(ck);
     if (hit)
         return JSON.stringify(hit);
-    var rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points, genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(prefix, "_games\n         ORDER BY rank\n         LIMIT $1 OFFSET $2"), [limit, offset]);
+    var rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points, genre, developer, publisher, released, icon, boxart, rating\n         FROM games\n         WHERE consoleid = $1\n         ORDER BY rank\n         LIMIT $2 OFFSET $3", [req.console_id, limit, offset]);
     var result = rows.map(rowToGame);
     cache.set(ck, result, TTL_GAMES_BY_CONSOLE);
     return JSON.stringify(result);
@@ -501,10 +485,7 @@ function rpcGetGameById(ctx, logger, nk, payload) {
     var hit = cache.get(ck);
     if (hit)
         return JSON.stringify(hit);
-    var unionParts = ALL_PREFIXES.map(function (p) {
-        return "SELECT rank, id, title, consolename, consoleid, totalplayers, casualplayers, hardcoreplayers,\n                numachievements, points, genre, developer, publisher, released, description,\n                icon, boxart, titlescreen, screenshot, rating\n         FROM ".concat(p, "_games WHERE id = $1");
-    });
-    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [req.game_id]);
+    var rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, casualplayers, hardcoreplayers,\n                numachievements, points, genre, developer, publisher, released, description,\n                icon, boxart, titlescreen, screenshot, rating\n         FROM games WHERE id = $1 LIMIT 1", [req.game_id]);
     if (rows.length === 0)
         throw new Error('Game not found');
     var game = rowToGame(rows[0]);
@@ -532,17 +513,14 @@ function rpcSearchGames(ctx, logger, nk, payload) {
     var hit = cache.get(ck);
     if (hit)
         return JSON.stringify(hit);
-    var prefixes;
+    var rows;
     if (req.console_id) {
-        prefixes = [requirePrefix(req.console_id)];
+        assertConsoleId(req.console_id);
+        rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                    genre, developer, publisher, released, icon, boxart, rating\n             FROM games WHERE consoleid = $1 AND LOWER(title) LIKE LOWER($2)\n             ORDER BY rank LIMIT $3", [req.console_id, pattern, limit]);
     }
     else {
-        prefixes = ALL_PREFIXES;
+        rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                    genre, developer, publisher, released, icon, boxart, rating\n             FROM games WHERE LOWER(title) LIKE LOWER($1)\n             ORDER BY rank LIMIT $2", [pattern, limit]);
     }
-    var unionParts = prefixes.map(function (p) {
-        return "SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(p, "_games WHERE LOWER(title) LIKE LOWER($1)");
-    });
-    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + " ORDER BY rank LIMIT $2", [pattern, limit]);
     var result = rows.map(rowToGame);
     cache.set(ck, result, TTL_GAMES_SEARCH);
     return JSON.stringify(result);
@@ -574,10 +552,7 @@ function rpcGetRelatedGames(ctx, logger, nk, payload) {
     if (relatedIds.length === 0)
         return JSON.stringify([]);
     var placeholders = relatedIds.map(function (_, i) { return "$".concat(i + 1); }).join(', ');
-    var unionParts = ALL_PREFIXES.map(function (p) {
-        return "SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                genre, developer, publisher, released, icon, boxart, rating\n         FROM ".concat(p, "_games WHERE id IN (").concat(placeholders, ")");
-    });
-    var rows = nk.sqlQuery(unionParts.join(' UNION ALL '), relatedIds);
+    var rows = nk.sqlQuery("SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,\n                genre, developer, publisher, released, icon, boxart, rating\n         FROM games WHERE id IN (".concat(placeholders, ")"), relatedIds);
     var result = rows.map(rowToGame);
     cache.set(ck, result, TTL_GAMES_RELATED);
     return JSON.stringify(result);
@@ -595,17 +570,7 @@ function rpcListRAGAchievementsByGame(ctx, logger, nk, payload) {
     }
     if (!req.game_id)
         throw new Error('game_id is required');
-    var rows;
-    if (req.console_id) {
-        var prefix = requirePrefix(req.console_id);
-        rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n             FROM ".concat(prefix, "_achievements\n             WHERE gameid = $1\n             ORDER BY displayorder"), [req.game_id]);
-    }
-    else {
-        var unionParts = ALL_PREFIXES.map(function (p) {
-            return "SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n             FROM ".concat(p, "_achievements WHERE gameid = $1");
-        });
-        rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' ORDER BY displayorder', [req.game_id]);
-    }
+    var rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM achievements\n         WHERE gameid = $1\n         ORDER BY displayorder", [req.game_id]);
     return JSON.stringify(rows.map(rowToAchievement));
 }
 // ─── RPC: Get single RA achievement by ID ────────────────────────────────────
@@ -625,10 +590,7 @@ function rpcGetRAAchievementById(ctx, logger, nk, payload) {
     var hit = cache.get(ck);
     if (hit)
         return JSON.stringify(hit);
-    var unionParts = ALL_PREFIXES.map(function (p) {
-        return "SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM ".concat(p, "_achievements WHERE achievementid = $1");
-    });
-    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [req.achievement_id]);
+    var rows = nk.sqlQuery("SELECT gameid, gametitle, achievementid, title, description, points, trueratio,\n                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr\n         FROM achievements WHERE achievementid = $1 LIMIT 1", [req.achievement_id]);
     if (rows.length === 0)
         throw new Error('Achievement not found');
     var ach = rowToAchievement(rows[0]);
@@ -663,11 +625,8 @@ function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
         var ua = existing[0].value;
         return JSON.stringify({ already_unlocked: true, unlocked_at: ua.unlocked_at, points_earned: ua.points_earned });
     }
-    // Fetch achievement from DB (search across all platforms)
-    var achUnion = ALL_PREFIXES.map(function (p) {
-        return "SELECT achievementid, title, points, gameid, gametitle, badgeurl\n         FROM ".concat(p, "_achievements WHERE achievementid = $1");
-    }).join(' UNION ALL ');
-    var achRows = nk.sqlQuery(achUnion + ' LIMIT 1', [req.achievement_id]);
+    // Fetch achievement from DB
+    var achRows = nk.sqlQuery("SELECT achievementid, title, points, gameid, gametitle, badgeurl\n         FROM achievements WHERE achievementid = $1 LIMIT 1", [req.achievement_id]);
     if (achRows.length === 0)
         throw new Error('Achievement not found');
     var achRow = achRows[0];
@@ -783,17 +742,7 @@ function rpcGetRomByMd5(ctx, logger, nk, payload) {
     var hit = cache.get(ck);
     if (hit)
         return JSON.stringify(hit);
-    var prefixes;
-    if (req.console_id) {
-        prefixes = [requirePrefix(req.console_id)];
-    }
-    else {
-        prefixes = ALL_PREFIXES;
-    }
-    var unionParts = prefixes.map(function (p) {
-        return "SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM ".concat(p, "_md5 WHERE LOWER(md5) = $1");
-    });
-    var rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [md5Lower]);
+    var rows = nk.sqlQuery("SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM md5 WHERE LOWER(md5) = $1 LIMIT 1", [md5Lower]);
     if (rows.length === 0)
         throw new Error('ROM not found');
     var rom = rowToRom(rows[0]);
@@ -817,10 +766,7 @@ function rpcListRomsByGame(ctx, logger, nk, payload) {
     var hit = cache.get(ck);
     if (hit)
         return JSON.stringify(hit);
-    var unionParts = ALL_PREFIXES.map(function (p) {
-        return "SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM ".concat(p, "_md5 WHERE gameid = $1");
-    });
-    var rows = nk.sqlQuery(unionParts.join(' UNION ALL '), [req.game_id]);
+    var rows = nk.sqlQuery("SELECT gameid, gametitle, md5, romname, labels, patchurl, region\n         FROM md5 WHERE gameid = $1", [req.game_id]);
     var result = rows.map(rowToRom);
     cache.set(ck, result, TTL_ROMS_BY_GAME);
     return JSON.stringify(result);

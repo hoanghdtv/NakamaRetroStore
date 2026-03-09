@@ -1,24 +1,9 @@
 // Games & RA-Achievements module — queries PostgreSQL tables populated from db/*.sql dumps
 
-// ─── Console → table prefix mapping ──────────────────────────────────────────
+// ─── Console IDs ─────────────────────────────────────────────────────────────
 
-/** Maps RetroAchievements consoleId → SQL table prefix */
-const CONSOLE_PREFIX: Record<number, string> = {
-    1:  'sega',
-    2:  'n64',
-    3:  'snes',
-    5:  'gba',
-    6:  'gbc',
-    7:  'nes',
-    12: 'psx',
-    16: 'gamecube',
-    18: 'nds',
-    27: 'mame',
-    41: 'psp',
-};
-
-/** All known prefixes (for cross-platform UNION queries) */
-const ALL_PREFIXES: string[] = [1, 2, 3, 5, 6, 7, 12, 16, 18, 27, 41].map((id: number) => CONSOLE_PREFIX[id]);
+/** All known RetroAchievements consoleIds */
+const ALL_CONSOLE_IDS: number[] = [1, 2, 3, 5, 6, 7, 12, 16, 18, 27, 41];
 
 /** Separate collection for RA unlocks — tránh lẫn với custom achievements */
 const COLLECTION_RA_USER_ACHIEVEMENTS = 'ra_user_achievements';
@@ -83,10 +68,8 @@ interface RARom {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function requirePrefix(consoleId: number): string {
-    const p = CONSOLE_PREFIX[consoleId];
-    if (!p) throw new Error(`Unsupported consoleId: ${consoleId}`);
-    return p;
+function assertConsoleId(consoleId: number): void {
+    if (ALL_CONSOLE_IDS.indexOf(consoleId) === -1) throw new Error(`Unsupported consoleId: ${consoleId}`);
 }
 
 function rowToGame(r: {[k: string]: any}): RAGame {
@@ -170,7 +153,7 @@ function rpcListGamesByConsole(ctx: nkruntime.Context, logger: nkruntime.Logger,
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
     if (!req.console_id) throw new Error('console_id is required');
 
-    const prefix = requirePrefix(req.console_id);
+    assertConsoleId(req.console_id);
     const limit  = Math.min(req.limit ?? 50, 200);
     const offset = req.offset ?? 0;
 
@@ -180,10 +163,11 @@ function rpcListGamesByConsole(ctx: nkruntime.Context, logger: nkruntime.Logger,
 
     const rows = nk.sqlQuery(
         `SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points, genre, developer, publisher, released, icon, boxart, rating
-         FROM ${prefix}_games
+         FROM games
+         WHERE consoleid = $1
          ORDER BY rank
-         LIMIT $1 OFFSET $2`,
-        [limit, offset]
+         LIMIT $2 OFFSET $3`,
+        [req.console_id, limit, offset]
     );
     const result = rows.map(rowToGame);
     cache.set(ck, result, TTL_GAMES_BY_CONSOLE);
@@ -202,13 +186,13 @@ function rpcGetGameById(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
     const hit = cache.get<RAGame>(ck);
     if (hit) return JSON.stringify(hit);
 
-    const unionParts = ALL_PREFIXES.map((p: string) =>
+    const rows = nk.sqlQuery(
         `SELECT rank, id, title, consolename, consoleid, totalplayers, casualplayers, hardcoreplayers,
                 numachievements, points, genre, developer, publisher, released, description,
                 icon, boxart, titlescreen, screenshot, rating
-         FROM ${p}_games WHERE id = $1`
+         FROM games WHERE id = $1 LIMIT 1`,
+        [req.game_id]
     );
-    const rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [req.game_id]);
     if (rows.length === 0) throw new Error('Game not found');
 
     const game = rowToGame(rows[0]);
@@ -232,23 +216,25 @@ function rpcSearchGames(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
     const hit = cache.get<RAGame[]>(ck);
     if (hit) return JSON.stringify(hit);
 
-    let prefixes: string[];
+    let rows: nkruntime.SqlQueryResult;
     if (req.console_id) {
-        prefixes = [requirePrefix(req.console_id)];
+        assertConsoleId(req.console_id);
+        rows = nk.sqlQuery(
+            `SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,
+                    genre, developer, publisher, released, icon, boxart, rating
+             FROM games WHERE consoleid = $1 AND LOWER(title) LIKE LOWER($2)
+             ORDER BY rank LIMIT $3`,
+            [req.console_id, pattern, limit]
+        );
     } else {
-        prefixes = ALL_PREFIXES;
+        rows = nk.sqlQuery(
+            `SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,
+                    genre, developer, publisher, released, icon, boxart, rating
+             FROM games WHERE LOWER(title) LIKE LOWER($1)
+             ORDER BY rank LIMIT $2`,
+            [pattern, limit]
+        );
     }
-
-    const unionParts = prefixes.map((p: string) =>
-        `SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,
-                genre, developer, publisher, released, icon, boxart, rating
-         FROM ${p}_games WHERE LOWER(title) LIKE LOWER($1)`
-    );
-
-    const rows = nk.sqlQuery(
-        unionParts.join(' UNION ALL ') + ` ORDER BY rank LIMIT $2`,
-        [pattern, limit]
-    );
     const result = rows.map(rowToGame);
     cache.set(ck, result, TTL_GAMES_SEARCH);
     return JSON.stringify(result);
@@ -277,13 +263,12 @@ function rpcGetRelatedGames(ctx: nkruntime.Context, logger: nkruntime.Logger, nk
     if (relatedIds.length === 0) return JSON.stringify([]);
 
     const placeholders = relatedIds.map((_, i) => `$${i + 1}`).join(', ');
-    const unionParts = ALL_PREFIXES.map((p: string) =>
+    const rows = nk.sqlQuery(
         `SELECT rank, id, title, consolename, consoleid, totalplayers, numachievements, points,
                 genre, developer, publisher, released, icon, boxart, rating
-         FROM ${p}_games WHERE id IN (${placeholders})`
+         FROM games WHERE id IN (${placeholders})`,
+        relatedIds
     );
-
-    const rows = nk.sqlQuery(unionParts.join(' UNION ALL '), relatedIds);
     const result = rows.map(rowToGame);
     cache.set(ck, result, TTL_GAMES_RELATED);
     return JSON.stringify(result);
@@ -297,28 +282,14 @@ function rpcListRAGAchievementsByGame(ctx: nkruntime.Context, logger: nkruntime.
     try { req = JSON.parse(payload); } catch (_) { throw new Error('Invalid JSON payload'); }
     if (!req.game_id) throw new Error('game_id is required');
 
-    let rows: nkruntime.SqlQueryResult;
-    if (req.console_id) {
-        const prefix = requirePrefix(req.console_id);
-        rows = nk.sqlQuery(
-            `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
-                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
-             FROM ${prefix}_achievements
-             WHERE gameid = $1
-             ORDER BY displayorder`,
-            [req.game_id]
-        );
-    } else {
-        const unionParts = ALL_PREFIXES.map((p: string) =>
-            `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
-                    type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
-             FROM ${p}_achievements WHERE gameid = $1`
-        );
-        rows = nk.sqlQuery(
-            unionParts.join(' UNION ALL ') + ' ORDER BY displayorder',
-            [req.game_id]
-        );
-    }
+    const rows = nk.sqlQuery(
+        `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
+                type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
+         FROM achievements
+         WHERE gameid = $1
+         ORDER BY displayorder`,
+        [req.game_id]
+    );
 
     return JSON.stringify(rows.map(rowToAchievement));
 }
@@ -335,13 +306,10 @@ function rpcGetRAAchievementById(ctx: nkruntime.Context, logger: nkruntime.Logge
     const hit = cache.get<RAAchievement>(ck);
     if (hit) return JSON.stringify(hit);
 
-    const unionParts = ALL_PREFIXES.map((p: string) =>
+    const rows = nk.sqlQuery(
         `SELECT gameid, gametitle, achievementid, title, description, points, trueratio,
                 type, author, badgeurl, numawarded, numawardedhardcore, displayorder, memaddr
-         FROM ${p}_achievements WHERE achievementid = $1`
-    );
-    const rows = nk.sqlQuery(
-        unionParts.join(' UNION ALL ') + ' LIMIT 1',
+         FROM achievements WHERE achievementid = $1 LIMIT 1`,
         [req.achievement_id]
     );
     if (rows.length === 0) throw new Error('Achievement not found');
@@ -375,12 +343,12 @@ function rpcUnlockRAAchievement(ctx: nkruntime.Context, logger: nkruntime.Logger
         return JSON.stringify({ already_unlocked: true, unlocked_at: ua.unlocked_at, points_earned: ua.points_earned });
     }
 
-    // Fetch achievement from DB (search across all platforms)
-    const achUnion = ALL_PREFIXES.map((p: string) =>
+    // Fetch achievement from DB
+    const achRows = nk.sqlQuery(
         `SELECT achievementid, title, points, gameid, gametitle, badgeurl
-         FROM ${p}_achievements WHERE achievementid = $1`
-    ).join(' UNION ALL ');
-    const achRows = nk.sqlQuery(achUnion + ' LIMIT 1', [req.achievement_id]);
+         FROM achievements WHERE achievementid = $1 LIMIT 1`,
+        [req.achievement_id]
+    );
     if (achRows.length === 0) throw new Error('Achievement not found');
 
     const achRow      = achRows[0];

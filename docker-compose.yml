@@ -26,7 +26,8 @@ services:
     build: .
     container_name: template_nk_backend
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     entrypoint:
       - "/bin/sh"
       - "-ecx"

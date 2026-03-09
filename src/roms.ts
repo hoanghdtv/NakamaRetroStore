@@ -15,18 +15,11 @@ function rpcGetRomByMd5(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: nk
     const hit = cache.get<RARom>(ck);
     if (hit) return JSON.stringify(hit);
 
-    let prefixes: string[];
-    if (req.console_id) {
-        prefixes = [requirePrefix(req.console_id)];
-    } else {
-        prefixes = ALL_PREFIXES;
-    }
-
-    const unionParts = prefixes.map((p: string) =>
+    const rows = nk.sqlQuery(
         `SELECT gameid, gametitle, md5, romname, labels, patchurl, region
-         FROM ${p}_md5 WHERE LOWER(md5) = $1`
+         FROM md5 WHERE LOWER(md5) = $1 LIMIT 1`,
+        [md5Lower]
     );
-    const rows = nk.sqlQuery(unionParts.join(' UNION ALL ') + ' LIMIT 1', [md5Lower]);
     if (rows.length === 0) throw new Error('ROM not found');
 
     const rom = rowToRom(rows[0]);
@@ -46,11 +39,11 @@ function rpcListRomsByGame(ctx: nkruntime.Context, logger: nkruntime.Logger, nk:
     const hit = cache.get<RARom[]>(ck);
     if (hit) return JSON.stringify(hit);
 
-    const unionParts = ALL_PREFIXES.map((p: string) =>
+    const rows = nk.sqlQuery(
         `SELECT gameid, gametitle, md5, romname, labels, patchurl, region
-         FROM ${p}_md5 WHERE gameid = $1`
+         FROM md5 WHERE gameid = $1`,
+        [req.game_id]
     );
-    const rows = nk.sqlQuery(unionParts.join(' UNION ALL '), [req.game_id]);
     const result = rows.map(rowToRom);
     cache.set(ck, result, TTL_ROMS_BY_GAME);
     return JSON.stringify(result);

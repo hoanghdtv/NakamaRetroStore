@@ -9,8 +9,9 @@ interface UserProfile {
     email: string;
     created_at: number; // unix timestamp (seconds)
     total_points: number;
-    achievements_unlocked: number; // optional, can be calculated on demand
-    rank?: number; // optional, can be calculated on demand
+    achievements_unlocked: number; 
+    level: number;
+
 }
 
 interface UserProfileUpdateRequest {
@@ -65,7 +66,7 @@ function rpcGetUserProfile(ctx: nkruntime.Context, logger: nkruntime.Logger, nk:
             created_at: Math.floor(new Date(user.createTime!).getTime() / 1000),
             total_points: 0,
             achievements_unlocked: 0,
-            rank: 1, // default rank; can be updated later based on points
+            level: 1, // default level; can be updated later based on points
 
         };
         storageUpsertProfile(nk, ctx.userId, profile);
@@ -103,7 +104,7 @@ function rpcAddUserPoints(ctx: nkruntime.Context, logger: nkruntime.Logger, nk: 
             created_at: Math.floor(new Date(user.createTime!).getTime() / 1000),
             total_points: 0,
             achievements_unlocked: 0,
-            rank: 1,
+            level: 1,
         };
     }
 

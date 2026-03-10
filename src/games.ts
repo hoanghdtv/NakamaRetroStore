@@ -373,25 +373,8 @@ function rpcUnlockRAAchievement(ctx: nkruntime.Context, logger: nkruntime.Logger
         permissionWrite: 0,
     }]);
 
-    // Add points to user profile — reuse helper từ users.ts
-    if (pointsEarned > 0) {
-        let profile = storageGetProfile(nk, ctx.userId);
-        if (!profile) {
-            const account = nk.accountGetId(ctx.userId);
-            const user = account.user!;
-            profile = {
-                id:           ctx.userId,
-                username:     user.username ?? '',
-                email:        account.email ?? '',
-                created_at:   Math.floor(new Date(user.createTime!).getTime() / 1000),
-                total_points: 0,
-                achievements_unlocked: 0,
-                rank: 1,
-            };
-        }
-        profile.total_points += pointsEarned;
-        storageUpsertProfile(nk, ctx.userId, profile);
-    }
+    // Update profile + all 3 leaderboards via shared helper
+    applyUnlockToProfile(nk, logger, ctx.userId, pointsEarned);
 
     logger.info('User %s unlocked RA achievement %d (+%d pts)', ctx.userId, req.achievement_id, pointsEarned);
 

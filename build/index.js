@@ -45,6 +45,8 @@ function rpcGetUserProfile(ctx, logger, nk, payload) {
             email: (_b = account.email) !== null && _b !== void 0 ? _b : '',
             created_at: Math.floor(new Date(user.createTime).getTime() / 1000),
             total_points: 0,
+            achievements_unlocked: 0,
+            level: 1, // default level; can be updated later based on points
         };
         storageUpsertProfile(nk, ctx.userId, profile);
         logger.info('Created new user profile for %s', ctx.userId);
@@ -78,6 +80,8 @@ function rpcAddUserPoints(ctx, logger, nk, payload) {
             email: (_b = account.email) !== null && _b !== void 0 ? _b : '',
             created_at: Math.floor(new Date(user.createTime).getTime() / 1000),
             total_points: 0,
+            achievements_unlocked: 0,
+            level: 1,
         };
     }
     profile.total_points += req.points;
@@ -110,6 +114,10 @@ var COLLECTION_GAME_ACH_INDEX = 'game_achievement_index';
 var COLLECTION_USER_ACHIEVEMENTS = 'user_achievements';
 // System-level records are stored under this fixed user ID
 var SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000000';
+// Nakama native leaderboard IDs for achievements unlocked count
+var LEADERBOARD_ACH_ALLTIME = 'achievements_unlocked'; // no reset
+var LEADERBOARD_ACH_WEEKLY = 'achievements_unlocked_weekly'; // resets every Monday
+var LEADERBOARD_ACH_MONTHLY = 'achievements_unlocked_monthly'; // resets 1st of month
 // ─── Storage helpers ─────────────────────────────────────────────────────────
 function achRead(nk, achievementId) {
     var objs = nk.storageRead([{
@@ -238,9 +246,41 @@ function rpcListGameAchievements(ctx, logger, nk, payload) {
     var achievements = objs.map(function (o) { return o.value; });
     return JSON.stringify(achievements);
 }
+// ─── Helper: update profile + all 3 leaderboards after any unlock ───────────
+function applyUnlockToProfile(nk, logger, userId, pointsEarned) {
+    var _a, _b, _c;
+    var profile = storageGetProfile(nk, userId);
+    if (!profile) {
+        var account = nk.accountGetId(userId);
+        var user = account.user;
+        profile = {
+            id: userId,
+            username: (_a = user.username) !== null && _a !== void 0 ? _a : '',
+            email: (_b = account.email) !== null && _b !== void 0 ? _b : '',
+            created_at: Math.floor(new Date(user.createTime).getTime() / 1000),
+            total_points: 0,
+            achievements_unlocked: 0,
+            level: 1,
+        };
+    }
+    profile.total_points += pointsEarned;
+    profile.achievements_unlocked = ((_c = profile.achievements_unlocked) !== null && _c !== void 0 ? _c : 0) + 1;
+    profile.level = calculateRank(profile.total_points);
+    storageUpsertProfile(nk, userId, profile);
+    try {
+        // all-time: absolute count; weekly+monthly: +1 per unlock (reset by cron)
+        nk.leaderboardRecordWrite(LEADERBOARD_ACH_ALLTIME, userId, '', profile.achievements_unlocked, 0, {});
+        nk.leaderboardRecordWrite(LEADERBOARD_ACH_WEEKLY, userId, '', 0, 0, {}, "increment" /* nkruntime.OverrideOperator.INCREMENTAL */);
+        nk.leaderboardRecordWrite(LEADERBOARD_ACH_MONTHLY, userId, '', 0, 0, {}, "increment" /* nkruntime.OverrideOperator.INCREMENTAL */);
+    }
+    catch (e) {
+        logger.warn('Failed to update achievements leaderboards for user %s: %s', userId, e);
+    }
+}
 // ─── RPC: Unlock achievement for current user ─────────────────────────────────
-// Payload: { "achievement_id": "..." }
+// Payload: { "achievement_id": "..." }  — accepts both custom UUID and numeric RA ID
 function rpcUnlockAchievement(ctx, logger, nk, payload) {
+    var _a;
     if (!ctx.userId)
         throw Error('No user ID in context');
     var req;
@@ -252,29 +292,96 @@ function rpcUnlockAchievement(ctx, logger, nk, payload) {
     }
     if (!req.achievement_id)
         throw Error('achievement_id is required');
-    // Verify achievement exists
+    // ── Try custom Nakama achievement first ──────────────────────────────────
     var ach = achRead(nk, req.achievement_id);
-    if (!ach)
-        throw Error('Achievement not found');
-    // Check already unlocked
-    var existing = userAchRead(nk, ctx.userId, req.achievement_id);
-    if (existing) {
-        return JSON.stringify({ already_unlocked: true, unlocked_at: existing.unlocked_at });
+    if (ach) {
+        // Check already unlocked
+        var existing = userAchRead(nk, ctx.userId, req.achievement_id);
+        if (existing) {
+            return JSON.stringify({ already_unlocked: true, unlocked_at: existing.unlocked_at });
+        }
+        var ua = {
+            user_id: ctx.userId,
+            achievement_id: ach.id,
+            unlocked_at: Math.floor(Date.now() / 1000),
+        };
+        userAchWrite(nk, ua);
+        applyUnlockToProfile(nk, logger, ctx.userId, ach.points);
+        logger.info('User %s unlocked custom achievement %s (+%d pts)', ctx.userId, ach.id, ach.points);
+        return JSON.stringify({ already_unlocked: false, unlocked_at: ua.unlocked_at, points_earned: ach.points });
     }
-    var ua = {
-        user_id: ctx.userId,
-        achievement_id: ach.id,
-        unlocked_at: Math.floor(Date.now() / 1000),
-    };
-    userAchWrite(nk, ua);
-    // Add points to user profile
-    var profile = storageGetProfile(nk, ctx.userId);
-    if (profile) {
-        profile.total_points += ach.points;
-        storageUpsertProfile(nk, ctx.userId, profile);
+    // ── Fallback: try RetroAchievements PostgreSQL DB (numeric ID) ───────────
+    var raId = parseInt(req.achievement_id, 10);
+    if (isNaN(raId))
+        throw Error("Achievement not found: ".concat(req.achievement_id));
+    var lockKey = "".concat(raId);
+    var raExisting = nk.storageRead([{ collection: 'ra_user_achievements', key: lockKey, userId: ctx.userId }]);
+    if (raExisting.length > 0) {
+        var ua = raExisting[0].value;
+        return JSON.stringify({ already_unlocked: true, unlocked_at: ua.unlocked_at, points_earned: ua.points_earned });
     }
-    logger.info('User %s unlocked achievement %s (+%d pts)', ctx.userId, ach.id, ach.points);
-    return JSON.stringify({ already_unlocked: false, unlocked_at: ua.unlocked_at, points_earned: ach.points });
+    var achRows = nk.sqlQuery("SELECT achievementid, title, points, gameid, gametitle, badgeurl\n         FROM achievements WHERE achievementid = $1 LIMIT 1", [raId]);
+    if (achRows.length === 0)
+        throw Error("Achievement not found: ".concat(req.achievement_id));
+    var achRow = achRows[0];
+    var points = (_a = achRow['points']) !== null && _a !== void 0 ? _a : 0;
+    var unlockedAt = Math.floor(Date.now() / 1000);
+    nk.storageWrite([{
+            collection: 'ra_user_achievements',
+            key: lockKey,
+            userId: ctx.userId,
+            value: {
+                achievement_id: raId,
+                achievement_title: achRow['title'],
+                game_id: achRow['gameid'],
+                game_title: achRow['gametitle'],
+                badge_url: achRow['badgeurl'],
+                points_earned: points,
+                unlocked_at: unlockedAt,
+            },
+            permissionRead: 2,
+            permissionWrite: 0,
+        }]);
+    applyUnlockToProfile(nk, logger, ctx.userId, points);
+    logger.info('User %s unlocked RA achievement %d (+%d pts) via unified endpoint', ctx.userId, raId, points);
+    return JSON.stringify({
+        already_unlocked: false,
+        unlocked_at: unlockedAt,
+        points_earned: points,
+        achievement_title: achRow['title'],
+        game_title: achRow['gametitle'],
+    });
+}
+// ─── RPC: Achievements leaderboard (top users by achievements_unlocked) ────────
+// Payload (optional): { "period": "alltime" | "weekly" | "monthly", "limit": 20, "cursor": "" }
+function rpcAchievementsLeaderboard(ctx, logger, nk, payload) {
+    var _a, _b;
+    var limit = 20;
+    var cursor = '';
+    var period = 'alltime';
+    if (payload) {
+        try {
+            var req = JSON.parse(payload);
+            if (typeof req.limit === 'number')
+                limit = Math.min(req.limit, 100);
+            if (typeof req.cursor === 'string')
+                cursor = req.cursor;
+            if (req.period === 'weekly' || req.period === 'monthly' || req.period === 'alltime')
+                period = req.period;
+        }
+        catch (_) { }
+    }
+    var leaderboardId = period === 'weekly' ? LEADERBOARD_ACH_WEEKLY :
+        period === 'monthly' ? LEADERBOARD_ACH_MONTHLY :
+            LEADERBOARD_ACH_ALLTIME;
+    var result = nk.leaderboardRecordsList(leaderboardId, [], limit, cursor);
+    var board = ((_a = result.records) !== null && _a !== void 0 ? _a : []).map(function (r) { return ({
+        rank: r.rank,
+        user_id: r.ownerId,
+        username: r.username,
+        achievements_unlocked: r.score,
+    }); });
+    return JSON.stringify({ period: period, records: board, next_cursor: (_b = result.nextCursor) !== null && _b !== void 0 ? _b : '' });
 }
 // ─── RPC: Get all achievements unlocked by current user ───────────────────────
 // No payload needed
@@ -285,6 +392,22 @@ function rpcGetUserAchievements(ctx, logger, nk, payload) {
     var result = nk.storageList(ctx.userId, COLLECTION_USER_ACHIEVEMENTS, 100, '');
     var userAchs = ((_a = result.objects) !== null && _a !== void 0 ? _a : []).map(function (o) { return o.value; });
     return JSON.stringify(userAchs);
+}
+function calculateRank(total_points) {
+    if (total_points <= 0)
+        return 1; // default rank for new users with no points
+    // Rank tiers based on cumulative points
+    if (total_points >= 500)
+        return 5; // Legend
+    if (total_points >= 100)
+        return 4; // Master
+    if (total_points >= 50)
+        return 3; // Expert
+    if (total_points >= 10)
+        return 2; // Intermediate
+    if (total_points >= 3)
+        return 1; // Novice
+    return 1; // Default rank for new users with no points
 }
 /**
  * Simple in-memory TTL cache cho Nakama JS runtime.
@@ -602,7 +725,7 @@ function rpcGetRAAchievementById(ctx, logger, nk, payload) {
 // Authorization: Bearer <token>
 // Payload: { "achievement_id": 3159 }
 function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
-    var _a, _b, _c;
+    var _a;
     if (!ctx.userId)
         throw new Error('Authentication required');
     var req;
@@ -649,23 +772,8 @@ function rpcUnlockRAAchievement(ctx, logger, nk, payload) {
             permissionRead: 2,
             permissionWrite: 0,
         }]);
-    // Add points to user profile — reuse helper từ users.ts
-    if (pointsEarned > 0) {
-        var profile = storageGetProfile(nk, ctx.userId);
-        if (!profile) {
-            var account = nk.accountGetId(ctx.userId);
-            var user = account.user;
-            profile = {
-                id: ctx.userId,
-                username: (_b = user.username) !== null && _b !== void 0 ? _b : '',
-                email: (_c = account.email) !== null && _c !== void 0 ? _c : '',
-                created_at: Math.floor(new Date(user.createTime).getTime() / 1000),
-                total_points: 0,
-            };
-        }
-        profile.total_points += pointsEarned;
-        storageUpsertProfile(nk, ctx.userId, profile);
-    }
+    // Update profile + all 3 leaderboards via shared helper
+    applyUnlockToProfile(nk, logger, ctx.userId, pointsEarned);
     logger.info('User %s unlocked RA achievement %d (+%d pts)', ctx.userId, req.achievement_id, pointsEarned);
     return JSON.stringify({
         already_unlocked: false,
@@ -795,6 +903,13 @@ function rpcUsersLeaderboard(ctx, logger, nk, payload) {
     return JSON.stringify(board);
 }
 function InitModule(ctx, logger, nk, initializer) {
+    // ── Nakama native leaderboards ────────────────────────────────────────────
+    // All-time: no reset, operator=set (tracks absolute unlocked count per user)
+    nk.leaderboardCreate(LEADERBOARD_ACH_ALLTIME, false, "descending" /* nkruntime.SortOrder.DESCENDING */, "set" /* nkruntime.Operator.SET */, null, null);
+    // Weekly: resets every Monday at 00:00 UTC, operator=increment (counts unlocks within the week)
+    nk.leaderboardCreate(LEADERBOARD_ACH_WEEKLY, false, "descending" /* nkruntime.SortOrder.DESCENDING */, "increment" /* nkruntime.Operator.INCREMENTAL */, '0 0 * * 1', null);
+    // Monthly: resets on 1st of each month at 00:00 UTC, operator=increment
+    nk.leaderboardCreate(LEADERBOARD_ACH_MONTHLY, false, "descending" /* nkruntime.SortOrder.DESCENDING */, "increment" /* nkruntime.Operator.INCREMENTAL */, '0 0 1 * *', null);
     // ── User endpoints (require Bearer token) ────────────────────────────────
     // GET  /v2/rpc/users-me
     initializer.registerRpc('users-me', rpcGetUserProfile);
@@ -807,6 +922,7 @@ function InitModule(ctx, logger, nk, initializer) {
     // GET  /v2/rpc/users-leaderboard?http_key=<key>  { "limit": 20 }
     initializer.registerRpc('users-leaderboard', rpcUsersLeaderboard);
     // ── Custom Achievement endpoints (Nakama storage) ─────────────────────────
+    // user achievements (unlocks, list) are stored in Nakama's storage engine for simplicity; since they are user-specific and change frequently, caching is not effective here.
     // POST /v2/rpc/achievements-create?http_key=<key>  { game_id, title, description, points, icon }
     initializer.registerRpc('achievements-create', rpcCreateAchievement);
     // POST /v2/rpc/achievements-by-id?http_key=<key>   { "achievement_id": "..." }
@@ -817,17 +933,20 @@ function InitModule(ctx, logger, nk, initializer) {
     initializer.registerRpc('user-achievements-unlock', rpcUnlockAchievement);
     // GET  /v2/rpc/user-achievements-list
     initializer.registerRpc('user-achievements-list', rpcGetUserAchievements);
+    // GET  /v2/rpc/achievements-leaderboard?http_key=<key>  { "limit": 20, "cursor": "" }
+    initializer.registerRpc('achievements-leaderboard', rpcAchievementsLeaderboard);
     // ── Games & Consoles (PostgreSQL DB) ──────────────────────────────────────
     // GET  /v2/rpc/games-consoles?http_key=<key>
-    initializer.registerRpc('games-consoles', rpcListConsoles);
-    // POST /v2/rpc/games-by-console?http_key=<key>  { "console_id": 7, "limit": 50, "offset": 0 }
-    initializer.registerRpc('games-by-console', rpcListGamesByConsole);
-    // POST /v2/rpc/games-by-id?http_key=<key>        { "game_id": 1446 }
-    initializer.registerRpc('games-by-id', rpcGetGameById);
-    // POST /v2/rpc/games-search?http_key=<key>       { "query": "mario", "console_id": 7, "limit": 20 }
-    initializer.registerRpc('games-search', rpcSearchGames);
-    // POST /v2/rpc/games-related?http_key=<key>      { "game_id": 1446 }
-    initializer.registerRpc('games-related', rpcGetRelatedGames);
+    // initializer.registerRpc('games-consoles',             rpcListConsoles);
+    // // POST /v2/rpc/games-by-console?http_key=<key>  { "console_id": 7, "limit": 50, "offset": 0 }
+    // initializer.registerRpc('games-by-console',           rpcListGamesByConsole);
+    // // POST /v2/rpc/games-by-id?http_key=<key>        { "game_id": 1446 }
+    // initializer.registerRpc('games-by-id',                rpcGetGameById);
+    // // POST /v2/rpc/games-search?http_key=<key>       { "query": "mario", "console_id": 7, "limit": 20 }
+    // initializer.registerRpc('games-search',               rpcSearchGames);
+    // // POST /v2/rpc/games-related?http_key=<key>      { "game_id": 1446 }
+    // initializer.registerRpc('games-related',              rpcGetRelatedGames);
+    // server-side caching for game data (since it doesn't change often and can be expensive to query)
     // ── RetroAchievements (PostgreSQL DB) ─────────────────────────────────────
     // POST /v2/rpc/ra-achievements-by-game?http_key=<key>  { "game_id": 1446 }
     initializer.registerRpc('ra-achievements-by-game', rpcListRAGAchievementsByGame);

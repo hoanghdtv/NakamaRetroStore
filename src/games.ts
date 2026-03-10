@@ -385,6 +385,8 @@ function rpcUnlockRAAchievement(ctx: nkruntime.Context, logger: nkruntime.Logger
                 email:        account.email ?? '',
                 created_at:   Math.floor(new Date(user.createTime!).getTime() / 1000),
                 total_points: 0,
+                achievements_unlocked: 0,
+                rank: 1,
             };
         }
         profile.total_points += pointsEarned;
